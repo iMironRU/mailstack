@@ -593,16 +593,83 @@ rdap_lookup() {
     | python3 -c "$RDAP_PARSER" 2>/dev/null
 }
 
+# Резервный источник для зон без публичного RDAP — например .ru и .рф,
+# где RDAP не отдаётся вовсе. Формат ответа тот же, что у rdap_lookup.
+WHOIS_PARSER='
+import sys, re, datetime
+
+domain = sys.argv[1].lower()
+text = sys.stdin.read()
+
+# Ответ whois для .ru начинается с блока о самой зоне RU, и поля из него
+# нельзя принимать за данные домена. Берём блок, где domain: равен запросу.
+block = text
+for b in re.split(r"\n\s*\n", text):
+    m = re.search(r"^\s*domain(?:\s+name)?:\s*(\S+)", b, re.I | re.M)
+    if m and m.group(1).lower().rstrip(".") == domain:
+        block = b
+        break
+
+def field(*names):
+    for n in names:
+        m = re.search(r"^\s*" + n + r":\s*(.+?)\s*$", block, re.I | re.M)
+        if m:
+            return m.group(1)
+    return ""
+
+status = field("state", "domain status", "status") or "-"
+registrar = field("registrar", "sponsoring registrar") or "-"
+
+expiry_days = "-"
+raw = field("paid-till", "registry expiry date", "expiration date",
+            "expires", "expiry date", "renewal date")
+if raw:
+    s = raw.strip().replace("Z", "+00:00")
+    for fmt in (None, "%Y-%m-%d", "%d-%b-%Y", "%Y.%m.%d", "%d.%m.%Y"):
+        try:
+            exp = datetime.datetime.fromisoformat(s) if fmt is None \
+                  else datetime.datetime.strptime(s.split("T")[0], fmt)
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=datetime.timezone.utc)
+            expiry_days = str((exp - datetime.datetime.now(datetime.timezone.utc)).days)
+            break
+        except Exception:
+            continue
+
+ns = ",".join(sorted(set(
+    n.lower().rstrip(".").split()[0]
+    for n in re.findall(r"^\s*(?:nserver|name server):\s*(.+?)\s*$", block, re.I | re.M)
+))) or "-"
+
+print(status + "|" + expiry_days + "|" + registrar + "|" + ns)
+'
+
+whois_lookup() {
+  local domain=$1
+  have whois || return 1
+  have python3 || return 1
+  whois "$domain" 2>/dev/null | python3 -c "$WHOIS_PARSER" "$domain" 2>/dev/null
+}
+
 check_domain_registration() {
   local domain=$1
   head1 "Регистрация домена $domain"
 
-  local rd; rd=$(rdap_lookup "$domain")
+  local rd src='RDAP'
+  rd=$(rdap_lookup "$domain")
   if [[ -z $rd ]]; then
-    warn "RDAP" "нет данных — домен может быть не зарегистрирован либо TLD не отдаёт RDAP"
+    # Зоны .ru, .рф и ряд других публичный RDAP не отдают вовсе
+    rd=$(whois_lookup "$domain")
+    src='whois'
+  fi
+
+  if [[ -z $rd ]]; then
+    warn "регистрация" "данных нет — ни RDAP, ни whois не ответили"
+    have whois || hint "Установи whois: apt-get install -y whois"
     hint "Проверь вручную: whois $domain"
     return
   fi
+  info "источник данных" "$src"
 
   local status days registrar ns
   IFS='|' read -r status days registrar ns <<<"$rd"
@@ -840,6 +907,7 @@ PY
 # ─────────────────────────────────────────────────────────────────────────────
 
 ASSUME_YES=0
+SKIP_RELAY=0
 
 has_tty() { [[ -r /dev/tty && -w /dev/tty ]]; }
 
@@ -913,6 +981,10 @@ interview() {
 # Настройка опциональна — её можно пропустить и вернуться к ней позже.
 ask_relay() {
   [[ -n ${RELAY_HOST:-} ]] && { info "SMTP-релей" "$RELAY_HOST (из окружения)"; return; }
+  if (( ${SKIP_RELAY:-0} )); then
+    warn "SMTP-релей" "пропущен по --no-relay — отправка наружу работать не будет"
+    return
+  fi
 
   # Спрашиваем только если 25-й действительно закрыт — иначе релей не нужен
   if tcp_probe alt1.aspmx.l.google.com 25 6; then
@@ -922,17 +994,31 @@ ask_relay() {
 
   printf '\n  %sИсходящий порт 25 заблокирован провайдером.%s\n' "$C_YEL" "$C_OFF"
   printf '  Почта будет приниматься, но не сможет уходить наружу напрямую.\n'
-  hint "Решение навсегда — тикет провайдеру на разблокировку 25."
-  hint "На это время можно отправлять через релей (smarthost) по порту 587:"
-  hint "свой другой почтовый сервер, либо Brevo (300 писем/сутки бесплатно)."
-  printf '\n'
+  printf '  Без релея стенд проверит только половину тракта — приём, но не отправку.\n\n'
+  printf '  Рекомендуемый вариант — %sBrevo%s: smtp-relay.brevo.com:587,\n' "$C_BLD" "$C_OFF"
+  printf '  300 писем в сутки бесплатно и бессрочно, регистрация занимает пару минут.\n'
+  printf '  Ключ берётся в панели: SMTP & API → SMTP.\n\n'
+  printf '  Подойдёт и любой другой свой сервер с открытым 25-м портом.\n\n'
 
-  if ! confirm "Настроить релей сейчас? (можно пропустить и добавить позже)"; then
-    info "SMTP-релей" "пропущен — отправка наружу работать не будет"
-    return
+  if ! confirm "Настроить релей сейчас?"; then
+    # Прерываемся осознанно: без релея и без открытого 25 отправка не
+    # заработает вовсе, и это выяснится уже после развёртывания — когда
+    # причину будут искать в конфигурации Poste.io, а не в блокировке порта.
+    printf '\n  %sУстановка остановлена.%s Что делать дальше — любой из вариантов:\n\n' "$C_YEL" "$C_OFF"
+    printf '  %s1.%s Открыть 25-й порт — решение навсегда, и оно всё равно понадобится для прода.\n' "$C_BLD" "$C_OFF"
+    printf '     Тикет в панели Selectel с обоснованием, что это почтовый сервер.\n'
+    printf '     После разблокировки просто запусти bootstrap снова — вопрос не появится.\n\n'
+    printf '  %s2.%s Завести релей и вернуться:\n' "$C_BLD" "$C_OFF"
+    printf '     Brevo — https://app.brevo.com → SMTP & API → SMTP → создать ключ.\n'
+    printf '     Затем: mailstack.sh bootstrap\n\n'
+    printf '  %s3.%s Использовать свой другой почтовый сервер как релей:\n' "$C_BLD" "$C_OFF"
+    printf '     нужны его хост, порт 587, логин и пароль ящика.\n\n'
+    printf '  %s4.%s Продолжить без отправки — стенд будет только принимать почту:\n' "$C_BLD" "$C_OFF"
+    printf '     mailstack.sh bootstrap --no-relay\n\n'
+    die "релей не настроен"
   fi
 
-  ask RELAY_HOST "Хост релея (например smtp-relay.brevo.com)"
+  ask RELAY_HOST "Хост релея" "smtp-relay.brevo.com"
   ask RELAY_PORT "Порт релея" "587"
   ask RELAY_USER "Логин на релее"
   # Пароль читаем без эха: он попадёт в .env с правами 600, но светить
@@ -1154,6 +1240,7 @@ cmd_bootstrap() {
       --email)    LE_EMAIL=${2:-}; shift 2 ;;
       --tz)       TZ_SETTING=${2:-}; shift 2 ;;
       --skip-domain-check) skip_domain=1; shift ;;
+      --no-relay) SKIP_RELAY=1; shift ;;
       -y|--yes)   ASSUME_YES=1; shift ;;
       *) die "неизвестный флаг bootstrap: $1" ;;
     esac
@@ -1390,6 +1477,7 @@ ${C_BLD}Флаги bootstrap${C_OFF}
   --email ADDR       Email для Let's Encrypt
   --tz ZONE          Часовой пояс
   --skip-domain-check  Не проверять домен перед установкой
+  --no-relay         Продолжить без SMTP-релея (только приём почты)
   -y, --yes          Не задавать вопросов (для автоматизации)
 
 ${C_BLD}Флаги doctor${C_OFF}
