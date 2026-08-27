@@ -121,10 +121,15 @@ PY
 
 # DNS-запрос. Возвращает значения записи по одному на строку.
 # dns_query NAME [TYPE]
+#
+# При таймауте `dig +short` пишет в stdout служебные строки вида
+# ";; connection timed out; no servers could be reached". Без фильтрации
+# вызывающий код принимает их за ответ — и проверка DNSBL сообщает о
+# несуществующем листинге. Отбрасываем всё, что начинается с ';'.
 dns_query() {
   local name=$1 type=${2:-A}
   if have dig; then
-    dig +short +time=3 +tries=1 "$name" "$type" 2>/dev/null
+    dig +short +time=3 +tries=1 "$name" "$type" 2>/dev/null | grep -v '^;' | grep -v '^[[:space:]]*$'
   elif have host; then
     host -W 3 -t "$type" "$name" 2>/dev/null | awk '/has address|address|text|mail is|domain name/ {print $NF}'
   elif have nslookup; then
@@ -434,6 +439,11 @@ check_dnsbl() {
       # Spamhaus отвечает так на запросы от публичных резолверов (8.8.8.8,
       # 1.1.1.1). Это отказ в обслуживании запроса, а НЕ листинг.
       warn "$zone" "запрос отклонён ($res) — используется публичный резолвер"
+    elif [[ ! $res =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      # Листинг в DNSBL — всегда адрес из 127.0.0.0/8. Всё остальное это
+      # сбой резолвера или мусор, а не ответ. Сообщать о листинге здесь
+      # нельзя: ложное «IP в чёрном списке» дороже пропущенной проверки.
+      warn "$zone" "не проверено — резолвер вернул '${res:0:48}'"
     else
       local txt; txt=$(dns_query "${rev}.${zone}" TXT | head -1 | tr -d '"')
       fail "$zone" "В СПИСКЕ: $res ${txt:+— $txt}"
