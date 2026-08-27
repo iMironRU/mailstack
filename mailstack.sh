@@ -5,7 +5,7 @@
 #
 # Самодостаточный скрипт: не требует ничего, кроме bash 4+ и coreutils.
 # Запуск на сервере:
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/mailstack.sh | bash -s -- preflight
+#   curl -fsSL https://raw.githubusercontent.com/iMironRU/mailstack/main/mailstack.sh | bash -s -- preflight
 #
 # Запуск снаружи (с рабочей машины), проверка портов и DNS со стороны интернета:
 #   ./mailstack.sh doctor --external --host mail.example.com
@@ -744,7 +744,7 @@ ${C_BLD}Флаги doctor${C_OFF}
 
 ${C_BLD}Примеры${C_OFF}
   # на чистом сервере
-  curl -fsSL <RAW_URL>/mailstack.sh | bash -s -- preflight
+  curl -fsSL https://raw.githubusercontent.com/iMironRU/mailstack/main/mailstack.sh | bash -s -- preflight
 
   # снаружи, после развёртывания
   ./mailstack.sh doctor --external --host mail.example.com --domain example.com
