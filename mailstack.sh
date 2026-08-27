@@ -534,6 +534,241 @@ check_domain_dns() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Состояние домена: регистрация, делегирование, что уже настроено
+#
+# Проверяется ДО установки. Домен может быть не делегирован, просрочен,
+# закрыт CAA-записью для Let's Encrypt или обслуживать живую почту на чужих
+# MX — всё это дешевле обнаружить сейчас, чем после развёртывания.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Подсказка: что конкретно сделать, чтобы починить найденную проблему
+hint() { printf '      %s↳ %s%s\n' "$C_DIM" "$1" "$C_OFF"; }
+
+# Данные о регистрации через RDAP (преемник whois). Отдаёт JSON по HTTP,
+# поэтому не требует установленного whois-клиента.
+# Печатает: STATUS|EXPIRY_DAYS|REGISTRAR|NS1,NS2,...
+#
+# Код парсера передаётся через -c, а не heredoc: heredoc занял бы stdin и
+# перекрыл JSON, приходящий по пайпу от curl.
+RDAP_PARSER='
+import sys, json, datetime
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+status = ",".join(d.get("status", [])) or "-"
+
+expiry_days = "-"
+for ev in d.get("events", []):
+    if ev.get("eventAction") == "expiration":
+        try:
+            s = ev["eventDate"].replace("Z", "+00:00")
+            exp = datetime.datetime.fromisoformat(s)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            expiry_days = str((exp - now).days)
+        except Exception:
+            pass
+
+registrar = "-"
+for ent in d.get("entities", []):
+    if "registrar" in ent.get("roles", []):
+        for item in ent.get("vcardArray", [[], []])[1]:
+            if item[0] == "fn":
+                registrar = str(item[3])
+                break
+
+ns = ",".join(sorted(n.get("ldhName", "").lower().rstrip(".")
+              for n in d.get("nameservers", []) if n.get("ldhName")))
+print(status + "|" + expiry_days + "|" + registrar + "|" + (ns or "-"))
+'
+
+rdap_lookup() {
+  local domain=$1
+  have curl || return 1
+  have python3 || return 1
+  # -L обязателен: rdap.org отвечает 302 на RDAP-сервер конкретного TLD
+  curl -fsSL --max-time 12 -H 'Accept: application/json' \
+       "https://rdap.org/domain/${domain}" 2>/dev/null \
+    | python3 -c "$RDAP_PARSER" 2>/dev/null
+}
+
+check_domain_registration() {
+  local domain=$1
+  head1 "Регистрация домена $domain"
+
+  local rd; rd=$(rdap_lookup "$domain")
+  if [[ -z $rd ]]; then
+    warn "RDAP" "нет данных — домен может быть не зарегистрирован либо TLD не отдаёт RDAP"
+    hint "Проверь вручную: whois $domain"
+    return
+  fi
+
+  local status days registrar ns
+  IFS='|' read -r status days registrar ns <<<"$rd"
+
+  ok "регистратор" "$registrar"
+
+  # clientHold / serverHold означают, что домен исключён из зоны TLD:
+  # он зарегистрирован, но не резолвится вообще ничем.
+  if [[ $status == *Hold* || $status == *hold* ]]; then
+    fail "статус" "$status — домен снят с делегирования регистратором"
+    hint "Домен не будет резолвиться, пока статус не снят."
+    hint "Обычная причина — неподтверждённый email владельца или неоплата."
+  else
+    ok "статус" "$status"
+  fi
+
+  if [[ $days == '-' ]]; then
+    info "срок регистрации" "дата не раскрыта"
+  elif (( days < 0 )); then
+    fail "срок регистрации" "истёк ${days#-} дн. назад"
+    hint "Продли домен до развёртывания — иначе почта встанет вместе с ним."
+  elif (( days < 30 )); then
+    warn "срок регистрации" "истекает через $days дн."
+    hint "Продли заранее: истечение домена останавливает и почту, и продление сертификатов."
+  else
+    ok "срок регистрации" "ещё $days дн."
+  fi
+
+  DOMAIN_RDAP_NS="$ns"
+}
+
+check_domain_delegation() {
+  local domain=$1
+  head1 "Делегирование $domain"
+
+  # SOA — признак того, что зона вообще существует и обслуживается
+  local soa; soa=$(dns_query "$domain" SOA | head -1)
+  if [[ -z $soa ]]; then
+    fail "зона (SOA)" "не отвечает — домен не делегирован или NS не настроены"
+    hint "В панели регистратора укажи NS-серверы своего DNS-провайдера."
+    hint "После смены NS делегирование расходится по интернету до 24 часов."
+    return 1
+  fi
+  ok "зона (SOA)" "${soa%% *}"
+
+  # NS, которые реально отвечают за зону
+  local zone_ns; zone_ns=$(dns_query "$domain" NS | sed 's/\.$//' | sort | tr '\n' ',' | sed 's/,$//')
+  if [[ -z $zone_ns ]]; then
+    fail "NS в зоне" "не найдены"
+    return 1
+  fi
+  ok "NS в зоне" "${zone_ns//,/ }"
+
+  # Сверка с тем, что прописано у регистратора. Расхождение — классическая
+  # причина «поменял записи, а ничего не изменилось»: правки вносятся в
+  # панель одного DNS-провайдера, а зону обслуживает другой.
+  if [[ -n ${DOMAIN_RDAP_NS:-} && $DOMAIN_RDAP_NS != '-' ]]; then
+    if [[ $DOMAIN_RDAP_NS == "$zone_ns" ]]; then
+      ok "NS у регистратора" "совпадают с зоной"
+    else
+      warn "NS у регистратора" "${DOMAIN_RDAP_NS//,/ }"
+      hint "Списки NS расходятся. Правки в панели того DNS, который НЕ указан"
+      hint "у регистратора, ни на что не влияют — проверь, где ведёшь зону."
+    fi
+  fi
+
+  # DNSSEC: при смене DNS-провайдера с включённым DNSSEC и неснятой DS-записью
+  # домен перестаёт резолвиться полностью.
+  local ds; ds=$(dns_query "$domain" DS | head -1)
+  if [[ -n $ds ]]; then
+    warn "DNSSEC" "включён (есть DS-запись)"
+    hint "Если будешь менять DNS-провайдера — сначала сними DS у регистратора,"
+    hint "иначе домен перестанет резолвиться целиком, а не частично."
+  else
+    ok "DNSSEC" "не включён"
+  fi
+  return 0
+}
+
+check_domain_caa() {
+  local domain=$1
+  head1 "CAA — разрешение на выпуск сертификатов"
+
+  local caa; caa=$(dns_query "$domain" CAA)
+  if [[ -z $caa ]]; then
+    ok "CAA" "не задана — выпуск разрешён любому CA"
+    return
+  fi
+
+  local flat; flat=$(tr '\n' ' ' <<<"$caa")
+  if grep -qi 'letsencrypt\.org' <<<"$flat"; then
+    ok "CAA" "Let's Encrypt разрешён"
+  else
+    fail "CAA" "$flat"
+    hint "CAA-запись есть, но letsencrypt.org в ней не указан — Let's Encrypt"
+    hint "откажет в выпуске, а NPM будет молча получать ошибку валидации."
+    hint "Добавь запись:  $domain.  CAA  0 issue \"letsencrypt.org\""
+  fi
+}
+
+check_domain_existing_mail() {
+  local domain=$1
+  head1 "Что уже настроено на $domain"
+
+  # Живые MX — главный риск: переключив их, можно оборвать работающую почту
+  local mx; mx=$(dns_query "$domain" MX | sort -n | tr '\n' ';' | sed 's/;$//')
+  if [[ -z $mx ]]; then
+    ok "MX" "не заданы — домен почту не обслуживает, конфликта нет"
+  else
+    warn "MX" "${mx//;/  }"
+    hint "На домене уже настроена почта. Переключение MX на наш сервер"
+    hint "оборвёт доставку в текущие ящики. Убедись, что домен свободен."
+  fi
+
+  local a; a=$(dns_query "$domain" A | head -1)
+  [[ -n $a ]] && info "A $domain" "$a" || info "A $domain" "не задана"
+
+  # Wildcard перехватывает mail./status./portainer. и ломает выпуск
+  # сертификатов незаметным образом: имя резолвится, но не туда.
+  local wild; wild=$(dns_query "test-mailstack-probe.$domain" A | head -1)
+  if [[ -n $wild ]]; then
+    warn "wildcard *.$domain" "есть — резолвится в $wild"
+    hint "Поддомены mail/status/portainer перехватит wildcard. Задай для них"
+    hint "явные A-записи, иначе сертификаты выпустятся не на тот адрес."
+  else
+    ok "wildcard" "нет"
+  fi
+
+  local spf; spf=$(dns_query "$domain" TXT | grep -i 'v=spf1' | head -1)
+  [[ -n $spf ]] && warn "SPF (существующий)" "${spf:0:60}" || info "SPF" "не задан"
+
+  # TTL важен для миграции: сутки TTL означают сутки расщеплённой доставки
+  local ttl
+  ttl=$(dig +noall +answer +time=3 +tries=1 "$domain" SOA 2>/dev/null | awk '{print $2; exit}')
+  if [[ -n $ttl ]]; then
+    if (( ttl > 3600 )); then
+      warn "TTL зоны" "${ttl}s"
+      hint "Перед переключением MX и перед миграцией снизь TTL до 300s"
+      hint "заранее — иначе смена записей будет расходиться до ${ttl}s."
+    else
+      ok "TTL зоны" "${ttl}s"
+    fi
+  fi
+}
+
+cmd_domain() {
+  local domain=${1:-${MAIL_DOMAIN:-}}
+  [[ -n $domain ]] || die "укажи домен: mailstack.sh domain example.com"
+  printf '%smailstack domain%s v%s — проверка %s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION" "$domain"
+
+  if ! have dig; then
+    die "нужен dig. Установи: apt-get install -y dnsutils"
+  fi
+
+  local ip; ip=$(detect_public_ip)
+  check_domain_registration "$domain"
+  if check_domain_delegation "$domain"; then
+    check_domain_caa "$domain"
+    check_domain_existing_mail "$domain"
+    check_domain_dns "$domain" "$ip"
+  fi
+
+  summary "Домен готов к развёртыванию" "Домен требует настройки — см. подсказки выше"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Состояние работающего стека
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -595,6 +830,326 @@ PY
 # ─────────────────────────────────────────────────────────────────────────────
 # Команды
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Интерактивный опрос
+#
+# Скрипт запускают через `curl ... | bash`, поэтому stdin занят пайпом и
+# обычный `read` немедленно вернёт пустоту. Читаем с управляющего терминала
+# напрямую через /dev/tty; если его нет (cron, CI) — требуем флаги.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ASSUME_YES=0
+
+has_tty() { [[ -r /dev/tty && -w /dev/tty ]]; }
+
+# ask ПЕРЕМЕННАЯ "Вопрос" "значение-по-умолчанию"
+ask() {
+  local var=$1 prompt=$2 def=${3:-} cur ans
+  eval "cur=\${$var:-}"
+  [[ -n $cur ]] && { info "$prompt" "$cur (из окружения)"; return; }
+
+  if ! has_tty; then
+    [[ -n $def ]] && { eval "$var=\$def"; return; }
+    die "нет терминала для вопроса «$prompt». Передай значение флагом или через .env"
+  fi
+
+  if [[ -n $def ]]; then
+    printf '  %s?%s %s [%s]: ' "$C_BLU" "$C_OFF" "$prompt" "$def" > /dev/tty
+  else
+    printf '  %s?%s %s: ' "$C_BLU" "$C_OFF" "$prompt" > /dev/tty
+  fi
+  IFS= read -r ans < /dev/tty || ans=''
+  [[ -z $ans ]] && ans=$def
+  eval "$var=\$ans"
+}
+
+# confirm "Вопрос" -> 0 если да
+confirm() {
+  local prompt=$1 ans
+  (( ASSUME_YES )) && return 0
+  has_tty || return 1
+  printf '  %s?%s %s [y/N]: ' "$C_BLU" "$C_OFF" "$prompt" > /dev/tty
+  IFS= read -r ans < /dev/tty || ans=''
+  [[ $ans =~ ^[yYдД] ]]
+}
+
+valid_domain() {
+  [[ $1 =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]]
+}
+
+valid_email() { [[ $1 =~ ^[^@[:space:]]+@[^@[:space:]]+\.[a-zA-Z]{2,}$ ]]; }
+
+# Опрос параметров стенда на старте bootstrap
+interview() {
+  head1 "Параметры стенда"
+
+  while :; do
+    ask MAIL_DOMAIN "Основной домен (например example.com)"
+    valid_domain "${MAIL_DOMAIN:-}" && break
+    warn "домен" "'${MAIL_DOMAIN:-}' не похож на доменное имя"
+    MAIL_DOMAIN=''
+    has_tty || die "домен не задан"
+  done
+
+  ask MAIL_HOSTNAME "FQDN почтового хоста" "mail.$MAIL_DOMAIN"
+
+  while :; do
+    ask LE_EMAIL "Email для Let's Encrypt и уведомлений"
+    valid_email "${LE_EMAIL:-}" && break
+    warn "email" "'${LE_EMAIL:-}' не похож на адрес"
+    LE_EMAIL=''
+    has_tty || die "email не задан"
+  done
+
+  ask TZ_SETTING "Часовой пояс" "$(cat /etc/timezone 2>/dev/null || echo UTC)"
+  ask MAILSTACK_DIR "Каталог установки" "$MAILSTACK_DIR"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOOTSTRAP — подготовка чистой ОС
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Выполнить шаг установки, прервавшись с внятным сообщением при ошибке
+run_step() {
+  local desc=$1; shift
+  if "$@" >/tmp/mailstack-step.log 2>&1; then
+    ok "$desc" "готово"
+  else
+    fail "$desc" "ошибка (последние строки лога ниже)"
+    sed 's/^/        /' /tmp/mailstack-step.log | tail -8
+    die "шаг «$desc» не выполнен"
+  fi
+}
+
+setup_swap() {
+  local size_mb=${1:-2048}
+  if swapon --show 2>/dev/null | grep -q .; then
+    ok "swap" "уже настроен"
+    return
+  fi
+  # fallocate быстрее, но на некоторых ФС даёт разреженный файл,
+  # непригодный под swap — тогда откатываемся на dd.
+  if ! fallocate -l "${size_mb}M" /swapfile 2>/dev/null; then
+    dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=none 2>/dev/null
+  fi
+  chmod 600 /swapfile
+  run_step "swap: mkswap" mkswap /swapfile
+  run_step "swap: включение" swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  # На почтовом сервере активный своп предпочтительнее, чем OOM-killer,
+  # прибивающий Dovecot посреди сессии, но и увлекаться им не стоит.
+  sysctl -qw vm.swappiness=10
+  grep -q 'vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
+  ok "swap" "${size_mb} MB создан и включён"
+}
+
+setup_hostname() {
+  local fqdn=$1
+  local current; current=$(hostname -f 2>/dev/null || hostname)
+  if [[ $current == "$fqdn" ]]; then
+    ok "hostname" "$fqdn (уже задан)"
+    return
+  fi
+  local short=${fqdn%%.*}
+  run_step "hostname: $fqdn" hostnamectl set-hostname "$fqdn"
+  # Без записи в /etc/hosts `hostname -f` не разрешится, и Postfix
+  # подставит в HELO неполное имя.
+  if ! grep -qE "^127\.0\.1\.1[[:space:]]+$fqdn" /etc/hosts; then
+    sed -i "/^127\.0\.1\.1/d" /etc/hosts
+    echo -e "127.0.1.1\t$fqdn $short" >> /etc/hosts
+  fi
+  ok "hostname" "$fqdn"
+}
+
+setup_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+  run_step "apt update" apt-get update -qq
+  run_step "apt upgrade" apt-get -y -qq upgrade
+  run_step "базовые пакеты" apt-get install -y -qq \
+    ca-certificates curl gnupg dnsutils whois jq ufw fail2ban \
+    unattended-upgrades apt-transport-https
+}
+
+setup_docker() {
+  if have docker && docker compose version >/dev/null 2>&1; then
+    ok "docker" "уже установлен: $(docker --version | awk '{print $3}' | tr -d ,)"
+  else
+    local codename id
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    id=$ID
+    codename=${VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null)}
+    install -m 0755 -d /etc/apt/keyrings
+    run_step "ключ репозитория Docker" bash -c \
+      "curl -fsSL https://download.docker.com/linux/$id/gpg -o /etc/apt/keyrings/docker.asc && chmod a+r /etc/apt/keyrings/docker.asc"
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$id $codename stable" \
+      > /etc/apt/sources.list.d/docker.list
+    run_step "apt update (docker)" apt-get update -qq
+    run_step "установка Docker" apt-get install -y -qq \
+      docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  fi
+
+  # userland-proxy подменяет source IP входящих соединений на адрес
+  # docker-моста. Для почты это критично: Rspamd увидит все письма как
+  # пришедшие с 172.17.0.1, и RBL с greylisting перестанут работать.
+  local dj=/etc/docker/daemon.json
+  if [[ -f $dj ]] && grep -q '"userland-proxy"' "$dj"; then
+    ok "daemon.json" "userland-proxy уже настроен"
+  else
+    mkdir -p /etc/docker
+    if [[ -f $dj ]] && have jq; then
+      jq '. + {"userland-proxy": false, "log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "3"}}' \
+        "$dj" > "$dj.new" && mv "$dj.new" "$dj"
+    else
+      cat > "$dj" <<'JSON'
+{
+  "userland-proxy": false,
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+JSON
+    fi
+    run_step "перезапуск Docker" systemctl restart docker
+    ok "daemon.json" "userland-proxy отключён, логи ограничены 30 MB на контейнер"
+  fi
+  systemctl enable -q docker 2>/dev/null
+}
+
+setup_firewall() {
+  # Порядок критичен: сначала разрешаем SSH, только потом включаем ufw.
+  # Обратный порядок обрывает текущую сессию и запирает снаружи.
+  ufw allow 22/tcp    >/dev/null 2>&1
+  ufw allow 80/tcp    >/dev/null 2>&1
+  ufw allow 443/tcp   >/dev/null 2>&1
+  for p in 25 465 587 993 995; do ufw allow "$p/tcp" >/dev/null 2>&1; done
+  ufw default deny incoming  >/dev/null 2>&1
+  ufw default allow outgoing >/dev/null 2>&1
+  if ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ok "ufw" "уже активен, правила обновлены"
+  else
+    run_step "включение ufw" bash -c "echo y | ufw enable"
+  fi
+  ok "ufw" "открыты 22, 80, 443, 25, 465, 587, 993, 995"
+
+  # ufw не фильтрует опубликованные Docker-порты: docker вставляет свои
+  # правила в цепочку DOCKER-USER раньше правил ufw. Поэтому админки
+  # защищаются не файрволом, а привязкой к 127.0.0.1 на этапе deploy.
+  hint "Админки NPM/Portainer/Kuma ufw не закроет — docker обходит его правила."
+  hint "На этапе deploy они публикуются только на 127.0.0.1 и доступны через SSH-туннель."
+}
+
+setup_fail2ban() {
+  [[ -d /etc/fail2ban ]] || { warn "fail2ban" "не установлен"; return; }
+  if [[ ! -f /etc/fail2ban/jail.local ]]; then
+    cat > /etc/fail2ban/jail.local <<'CONF'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+
+[sshd]
+enabled = true
+CONF
+  fi
+  systemctl enable -q fail2ban 2>/dev/null
+  run_step "fail2ban" systemctl restart fail2ban
+}
+
+save_env() {
+  local dir=$MAILSTACK_DIR
+  mkdir -p "$dir"
+  local f="$dir/.env"
+  # .env содержит адреса и пути, а впоследствии — пароли S3 и restic.
+  # Права 600 задаются до записи, чтобы файл не существовал открытым даже
+  # доли секунды.
+  touch "$f"; chmod 600 "$f"
+  cat > "$f" <<CONF
+# Создано mailstack.sh $MAILSTACK_VERSION
+MAIL_DOMAIN=$MAIL_DOMAIN
+MAIL_HOSTNAME=$MAIL_HOSTNAME
+LE_EMAIL=$LE_EMAIL
+TZ=$TZ_SETTING
+MAILSTACK_DIR=$MAILSTACK_DIR
+CONF
+  ok ".env сохранён" "$f (права 600)"
+}
+
+cmd_bootstrap() {
+  local skip_domain=0
+  while (( $# )); do
+    case "$1" in
+      --domain)   MAIL_DOMAIN=${2:-}; shift 2 ;;
+      --hostname) MAIL_HOSTNAME=${2:-}; shift 2 ;;
+      --email)    LE_EMAIL=${2:-}; shift 2 ;;
+      --tz)       TZ_SETTING=${2:-}; shift 2 ;;
+      --skip-domain-check) skip_domain=1; shift ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      *) die "неизвестный флаг bootstrap: $1" ;;
+    esac
+  done
+
+  printf '%smailstack bootstrap%s v%s — %s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION" "$(date '+%Y-%m-%d %H:%M')"
+  need_root
+  load_env
+
+  : "${TZ_SETTING:=${TZ:-UTC}}"
+  interview
+
+  # dig нужен для проверок домена, а его на чистой Ubuntu может не быть
+  if ! have dig; then
+    info "dnsutils" "устанавливаю, нужен для проверки DNS"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dnsutils >/dev/null 2>&1
+  fi
+
+  if (( ! skip_domain )); then
+    local ip; ip=$(detect_public_ip)
+    check_domain_registration "$MAIL_DOMAIN"
+    if check_domain_delegation "$MAIL_DOMAIN"; then
+      check_domain_caa "$MAIL_DOMAIN"
+      check_domain_existing_mail "$MAIL_DOMAIN"
+      check_domain_dns "$MAIL_DOMAIN" "$ip"
+    fi
+
+    if (( N_FAIL > 0 )); then
+      printf '\n  %sНайдено %d проблем с доменом.%s Установить систему можно и сейчас —\n' "$C_YEL" "$N_FAIL" "$C_OFF"
+      printf '  DNS понадобится только на этапе deploy, когда будут выпускаться сертификаты.\n'
+      confirm "Продолжить установку, разобравшись с DNS позже?" || die "прервано. Исправь DNS и запусти снова."
+    elif (( N_WARN > 0 )); then
+      printf '\n  %s%d предупреждений по домену%s — на установку не влияют.\n' "$C_YEL" "$N_WARN" "$C_OFF"
+    fi
+  fi
+
+  head1 "План изменений на этой машине"
+  info "swap" "создать 2 GB, если отсутствует"
+  info "hostname" "$MAIL_HOSTNAME"
+  info "часовой пояс" "$TZ_SETTING"
+  info "пакеты" "обновление системы + curl, dnsutils, jq, ufw, fail2ban"
+  info "docker" "Docker CE + compose plugin, userland-proxy отключён"
+  info "firewall" "ufw: 22, 80, 443, 25, 465, 587, 993, 995"
+  info "fail2ban" "защита ssh"
+  printf '\n'
+  confirm "Применить?" || die "прервано пользователем"
+
+  N_PASS=0; N_WARN=0; N_FAIL=0
+
+  head1 "Установка"
+  setup_swap 2048
+  run_step "часовой пояс: $TZ_SETTING" timedatectl set-timezone "$TZ_SETTING"
+  setup_hostname "$MAIL_HOSTNAME"
+  setup_packages
+  setup_docker
+  setup_firewall
+  setup_fail2ban
+  save_env
+
+  head1 "Готово"
+  info "следующий шаг" "mailstack.sh deploy"
+  [[ -n ${MAIL_DOMAIN:-} ]] && info "проверка домена" "mailstack.sh domain $MAIL_DOMAIN"
+  summary "Машина подготовлена" "Установка завершилась с ошибками"
+}
 
 cmd_preflight() {
   printf '%smailstack preflight%s v%s — %s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -740,12 +1295,21 @@ ${C_BLD}mailstack.sh${C_OFF} v$MAILSTACK_VERSION — почтовый стек �
 
 ${C_BLD}Команды${C_OFF}
   preflight          Проверить, можно ли ставить стек на эту машину
+  domain DOMAIN      Проверить домен: регистрация, делегирование, CAA, записи
+  bootstrap          Подготовка ОС: swap, Docker, ufw, hostname, fail2ban
   doctor             Диагностика: репутация IP, DNS, порты, контейнеры
-  bootstrap          Подготовка ОС: swap, Docker, ufw, hostname      ${C_DIM}(в работе)${C_OFF}
   deploy             Развернуть стек                                  ${C_DIM}(в работе)${C_OFF}
   update             Обновить образы и систему                        ${C_DIM}(в работе)${C_OFF}
   backup / restore   Резервное копирование в S3 (restic)              ${C_DIM}(в работе)${C_OFF}
   migrate            Переезд на другую виртуалку                      ${C_DIM}(в работе)${C_OFF}
+
+${C_BLD}Флаги bootstrap${C_OFF}
+  --domain DOMAIN    Основной домен (иначе спросит интерактивно)
+  --hostname FQDN    FQDN почтового хоста (по умолчанию mail.\$DOMAIN)
+  --email ADDR       Email для Let's Encrypt
+  --tz ZONE          Часовой пояс
+  --skip-domain-check  Не проверять домен перед установкой
+  -y, --yes          Не задавать вопросов (для автоматизации)
 
 ${C_BLD}Флаги doctor${C_OFF}
   --external         Проверка снаружи (запускать с рабочей машины, не с сервера)
@@ -772,7 +1336,9 @@ main() {
   case "$cmd" in
     preflight) cmd_preflight "$@" ;;
     doctor)    cmd_doctor "$@" ;;
-    bootstrap|deploy|update|backup|restore|migrate) cmd_todo "$cmd" ;;
+    domain)    cmd_domain "$@" ;;
+    bootstrap) cmd_bootstrap "$@" ;;
+    deploy|update|backup|restore|migrate) cmd_todo "$cmd" ;;
     help|--help|-h) usage ;;
     version|--version) echo "mailstack.sh $MAILSTACK_VERSION" ;;
     *) usage; exit 1 ;;
