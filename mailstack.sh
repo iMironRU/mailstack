@@ -1020,6 +1020,14 @@ ask_relay() {
 
   ask RELAY_HOST "Хост релея" "smtp-relay.brevo.com"
   ask RELAY_PORT "Порт релея" "587"
+
+  # У Brevo логин — не email аккаунта, а выданный адрес вида xxx@smtp-brevo.com,
+  # а пароль — SMTP key, не API key и не пароль от аккаунта. Оба берутся в
+  # Settings → SMTP & API → SMTP; ключ показывается только при создании.
+  if [[ ${RELAY_HOST:-} == *brevo* ]]; then
+    hint "Логин Brevo — не email аккаунта, а адрес вида xxxxx@smtp-brevo.com"
+    hint "Пароль — SMTP key (не API key). Settings → SMTP & API → SMTP."
+  fi
   ask RELAY_USER "Логин на релее"
   # Пароль читаем без эха: он попадёт в .env с правами 600, но светить
   # его в терминале и в истории всё равно незачем.
