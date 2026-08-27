@@ -15,8 +15,9 @@
 | Команда | Состояние |
 |---|---|
 | `preflight` | готово |
+| `domain` | готово |
+| `bootstrap` | готово |
 | `doctor` | готово |
-| `bootstrap` | в работе |
 | `deploy` | в работе |
 | `update` | в работе |
 | `backup` / `restore` | в работе |

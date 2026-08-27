@@ -1272,11 +1272,23 @@ doctor_external() {
   summary "Стенд доступен снаружи корректно" "Есть проблемы с доступностью"
 }
 
+# Русское склонение после числительного: 1 ошибка, 2 ошибки, 5 ошибок
+plural() {
+  local n=$1 one=$2 few=$3 many=$4
+  local n100=$((n % 100)) n10=$((n % 10))
+  if (( n100 >= 11 && n100 <= 14 )); then echo "$many"
+  elif (( n10 == 1 )); then echo "$one"
+  elif (( n10 >= 2 && n10 <= 4 )); then echo "$few"
+  else echo "$many"; fi
+}
+
 summary() {
   local good=$1 bad=$2
   printf '\n%s─────────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
-  printf '  %s%d пройдено%s   %s%d предупреждений%s   %s%d ошибок%s\n' \
-    "$C_GRN" "$N_PASS" "$C_OFF" "$C_YEL" "$N_WARN" "$C_OFF" "$C_RED" "$N_FAIL" "$C_OFF"
+  printf '  %s%d пройдено%s   %s%d %s%s   %s%d %s%s\n' \
+    "$C_GRN" "$N_PASS" "$C_OFF" \
+    "$C_YEL" "$N_WARN" "$(plural "$N_WARN" предупреждение предупреждения предупреждений)" "$C_OFF" \
+    "$C_RED" "$N_FAIL" "$(plural "$N_FAIL" ошибка ошибки ошибок)" "$C_OFF"
   if (( N_FAIL > 0 )); then
     printf '  %s%s%s\n\n' "$C_RED" "$bad" "$C_OFF"
     exit 1
