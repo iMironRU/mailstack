@@ -904,6 +904,46 @@ interview() {
 
   ask TZ_SETTING "Часовой пояс" "$(cat /etc/timezone 2>/dev/null || echo UTC)"
   ask MAILSTACK_DIR "Каталог установки" "$MAILSTACK_DIR"
+
+  ask_relay
+}
+
+# SMTP-релей (smarthost). Нужен, когда провайдер блокирует исходящий порт 25:
+# сервер продолжает принимать почту, но доставлять её напрямую не может.
+# Настройка опциональна — её можно пропустить и вернуться к ней позже.
+ask_relay() {
+  [[ -n ${RELAY_HOST:-} ]] && { info "SMTP-релей" "$RELAY_HOST (из окружения)"; return; }
+
+  # Спрашиваем только если 25-й действительно закрыт — иначе релей не нужен
+  if tcp_probe alt1.aspmx.l.google.com 25 6; then
+    info "SMTP-релей" "не требуется, исходящий порт 25 открыт"
+    return
+  fi
+
+  printf '\n  %sИсходящий порт 25 заблокирован провайдером.%s\n' "$C_YEL" "$C_OFF"
+  printf '  Почта будет приниматься, но не сможет уходить наружу напрямую.\n'
+  hint "Решение навсегда — тикет провайдеру на разблокировку 25."
+  hint "На это время можно отправлять через релей (smarthost) по порту 587:"
+  hint "свой другой почтовый сервер, либо Brevo (300 писем/сутки бесплатно)."
+  printf '\n'
+
+  if ! confirm "Настроить релей сейчас? (можно пропустить и добавить позже)"; then
+    info "SMTP-релей" "пропущен — отправка наружу работать не будет"
+    return
+  fi
+
+  ask RELAY_HOST "Хост релея (например smtp-relay.brevo.com)"
+  ask RELAY_PORT "Порт релея" "587"
+  ask RELAY_USER "Логин на релее"
+  # Пароль читаем без эха: он попадёт в .env с правами 600, но светить
+  # его в терминале и в истории всё равно незачем.
+  if has_tty; then
+    printf '  %s?%s %s: ' "$C_BLU" "$C_OFF" "Пароль на релее" > /dev/tty
+    stty -echo < /dev/tty 2>/dev/null
+    IFS= read -r RELAY_PASS < /dev/tty || RELAY_PASS=''
+    stty echo < /dev/tty 2>/dev/null
+    printf '\n' > /dev/tty
+  fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1073,6 +1113,35 @@ LE_EMAIL=$LE_EMAIL
 TZ=$TZ_SETTING
 MAILSTACK_DIR=$MAILSTACK_DIR
 CONF
+
+  # SMTP-релей: заполняется, только если провайдер блокирует исходящий 25
+  if [[ -n ${RELAY_HOST:-} ]]; then
+    cat >> "$f" <<CONF
+
+# SMTP-релей (smarthost) — обход блокировки исходящего порта 25
+RELAY_HOST=$RELAY_HOST
+RELAY_PORT=${RELAY_PORT:-587}
+RELAY_USER=${RELAY_USER:-}
+RELAY_PASS='${RELAY_PASS:-}'
+CONF
+  fi
+
+  # Бэкап настраивается отдельно и в любой момент — он намеренно не
+  # блокирует развёртывание. Оставляем заготовку с подсказками.
+  if ! grep -q '^RESTIC_REPOSITORY=' "$f" 2>/dev/null; then
+    cat >> "$f" <<'CONF'
+
+# Резервное копирование — настраивается командой: mailstack.sh backup setup
+# Примеры строки репозитория restic:
+#   sftp:backup@backup-host:/srv/mailstack     — по ssh, нативно, без лишних слоёв
+#   /mnt/backup/mailstack                      — локальный каталог или примонтированный диск
+#   s3:https://s3.storage.selcloud.ru/bucket   — S3 (Selectel, MinIO, Yandex)
+#   s3:https://s3.us-west-004.backblazeb2.com/bucket  — Backblaze B2 через S3 API
+#   rclone:remote:path                         — всё остальное, включая FTP и WebDAV
+# RESTIC_REPOSITORY=
+CONF
+  fi
+
   ok ".env сохранён" "$f (права 600)"
 }
 
