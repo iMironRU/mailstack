@@ -859,6 +859,129 @@ check_domain_existing_mail() {
   fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Проверка SMTP-релея
+#
+# Ошибку в кредах релея иначе видно только по молчащей очереди Postfix:
+# письма принимаются, ставятся в очередь и тихо копятся. Проверяем связку
+# заранее — соединение, STARTTLS и собственно аутентификацию.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RELAY_TEST='
+import smtplib, ssl, sys, os
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+user = os.environ.get("RELAY_USER", "")
+# Пароль передаётся окружением, а не аргументом: аргументы видны в ps
+password = os.environ.get("RELAY_PASS", "")
+
+try:
+    if port == 465:
+        srv = smtplib.SMTP_SSL(host, port, timeout=15)
+    else:
+        srv = smtplib.SMTP(host, port, timeout=15)
+        srv.ehlo()
+        if srv.has_extn("starttls"):
+            srv.starttls(context=ssl.create_default_context())
+            srv.ehlo()
+        else:
+            print("WARN|сервер не предлагает STARTTLS — пароль уйдёт открытым текстом")
+except Exception as e:
+    print("CONN|" + str(e))
+    sys.exit(1)
+
+banner = (srv.ehlo_resp or b"").decode("utf-8", "replace").splitlines()
+print("CONN_OK|" + (banner[0] if banner else host))
+
+if not user:
+    print("NOAUTH|логин не задан")
+    srv.quit()
+    sys.exit(0)
+
+try:
+    srv.login(user, password)
+    print("AUTH_OK|аутентификация принята")
+except smtplib.SMTPAuthenticationError as e:
+    code = e.smtp_code
+    msg = e.smtp_error.decode("utf-8", "replace") if isinstance(e.smtp_error, bytes) else str(e.smtp_error)
+    print("AUTH_FAIL|" + str(code) + " " + msg)
+except Exception as e:
+    print("AUTH_ERR|" + str(e))
+finally:
+    try:
+        srv.quit()
+    except Exception:
+        pass
+'
+
+check_relay() {
+  head1 "SMTP-релей"
+  if [[ -z ${RELAY_HOST:-} ]]; then
+    info "релей" "не настроен"
+    return
+  fi
+  local port=${RELAY_PORT:-587}
+  info "релей" "$RELAY_HOST:$port"
+
+  have python3 || { warn "проверка релея" "нужен python3"; return; }
+
+  local out
+  out=$(RELAY_USER="${RELAY_USER:-}" RELAY_PASS="${RELAY_PASS:-}" \
+        python3 -c "$RELAY_TEST" "$RELAY_HOST" "$port" 2>&1)
+
+  local line kind text
+  while IFS= read -r line; do
+    kind=${line%%|*}; text=${line#*|}
+    case "$kind" in
+      CONN_OK)   ok   "соединение" "$text" ;;
+      CONN)      fail "соединение" "$text"
+                 hint "Проверь хост и порт, а также что исходящий $port не заблокирован." ;;
+      AUTH_OK)   ok   "аутентификация" "$text" ;;
+      NOAUTH)    warn "аутентификация" "$text" ;;
+      AUTH_FAIL) fail "аутентификация" "$text"
+                 if [[ ${RELAY_HOST:-} == *brevo* ]]; then
+                   # Самая частая ошибка с Brevo: подставляют email аккаунта
+                   # вместо выданного логина, либо API key вместо SMTP key.
+                   hint "У Brevo логин — не email аккаунта, а адрес вида xxxxx@smtp-brevo.com."
+                   hint "Пароль — SMTP key, не API key и не пароль от аккаунта."
+                   hint "Оба значения: Settings → SMTP & API → вкладка SMTP."
+                 else
+                   hint "Проверь логин и пароль на релее."
+                 fi ;;
+      AUTH_ERR)  warn "аутентификация" "$text" ;;
+      WARN)      warn "STARTTLS" "$text" ;;
+    esac
+  done <<<"$out"
+}
+
+cmd_relay_test() {
+  printf '%smailstack relay-test%s v%s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION"
+  load_env
+  while (( $# )); do
+    case "$1" in
+      --host) RELAY_HOST=${2:-}; shift 2 ;;
+      --port) RELAY_PORT=${2:-}; shift 2 ;;
+      --user) RELAY_USER=${2:-}; shift 2 ;;
+      *) die "неизвестный флаг relay-test: $1" ;;
+    esac
+  done
+
+  [[ -n ${RELAY_HOST:-} ]] || die "релей не настроен. Укажи --host или заполни RELAY_* в .env"
+
+  # Пароль не принимаем аргументом — он остался бы в history и в ps
+  if [[ -z ${RELAY_PASS:-} ]] && has_tty; then
+    printf '  %s?%s Пароль (SMTP key): ' "$C_BLU" "$C_OFF" > /dev/tty
+    stty -echo < /dev/tty 2>/dev/null
+    IFS= read -r RELAY_PASS < /dev/tty || RELAY_PASS=''
+    stty echo < /dev/tty 2>/dev/null
+    printf '\n' > /dev/tty
+  fi
+
+  check_relay
+  summary "Релей работает — письма смогут уходить наружу" "Релей не работает"
+}
+
 cmd_domain() {
   local domain=${1:-${MAIL_DOMAIN:-}}
   [[ -n $domain ]] || die "укажи домен: mailstack.sh domain example.com"
@@ -1404,6 +1527,7 @@ cmd_doctor() {
     check_resources
     check_ports
     check_stack
+    check_relay
     check_rdns "$ip"
     check_dnsbl "$ip"
     [[ -n $domain ]] && check_domain_dns "$domain" "$ip"
@@ -1520,6 +1644,7 @@ ${C_BLD}Команды${C_OFF}
   domain DOMAIN      Проверить домен: регистрация, делегирование, CAA, записи
   bootstrap          Подготовка ОС: swap, Docker, ufw, hostname, fail2ban
   doctor             Диагностика: репутация IP, DNS, порты, контейнеры
+  relay-test         Проверить SMTP-релей: соединение, STARTTLS, аутентификация
   deploy             Развернуть стек                                  ${C_DIM}(в работе)${C_OFF}
   update             Обновить образы и систему                        ${C_DIM}(в работе)${C_OFF}
   backup / restore   Резервное копирование в S3 (restic)              ${C_DIM}(в работе)${C_OFF}
@@ -1560,6 +1685,7 @@ main() {
     preflight) cmd_preflight "$@" ;;
     doctor)    cmd_doctor "$@" ;;
     domain)    cmd_domain "$@" ;;
+    relay-test) cmd_relay_test "$@" ;;
     bootstrap) cmd_bootstrap "$@" ;;
     deploy|update|backup|restore|migrate) cmd_todo "$cmd" ;;
     help|--help|-h) usage ;;
