@@ -492,7 +492,7 @@ check_domain_dns() {
   head1 "DNS-записи домена $domain"
   local mail_host="${MAIL_HOSTNAME:-mail.$domain}"
 
-  local a; a=$(dns_query "$mail_host" A | head -1)
+  local a; a=$(dns_auth "$mail_host" A | head -1)
   if [[ -z $a ]]; then
     fail "A $mail_host" "не задана — Let's Encrypt не выдаст сертификат"
   elif [[ -n $ip && $a != "$ip" ]]; then
@@ -502,13 +502,13 @@ check_domain_dns() {
   fi
 
   for sub in status portainer; do
-    local sa; sa=$(dns_query "$sub.$domain" A | head -1)
+    local sa; sa=$(dns_auth "$sub.$domain" A | head -1)
     if [[ -z $sa ]]; then warn "A $sub.$domain" "не задана"
     elif [[ -n $ip && $sa != "$ip" ]]; then warn "A $sub.$domain" "указывает на $sa"
     else ok "A $sub.$domain" "$sa"; fi
   done
 
-  local mx; mx=$(dns_query "$domain" MX | head -3 | tr '\n' ' ')
+  local mx; mx=$(dns_auth "$domain" MX | head -3 | tr '\n' ' ')
   if [[ -z $mx ]]; then
     fail "MX $domain" "не задана — входящая почта не придёт"
   elif grep -q "${mail_host%.}" <<<"$mx"; then
@@ -517,18 +517,18 @@ check_domain_dns() {
     warn "MX $domain" "$mx — не указывает на $mail_host"
   fi
 
-  local spf; spf=$(dns_query "$domain" TXT | grep -i 'v=spf1' | head -1)
+  local spf; spf=$(dns_auth "$domain" TXT | grep -i 'v=spf1' | head -1)
   if [[ -z $spf ]]; then warn "SPF" "запись v=spf1 не найдена"
   else ok "SPF" "${spf:0:70}"; fi
 
-  local dkim; dkim=$(dns_query "s1._domainkey.$domain" TXT | head -1)
+  local dkim; dkim=$(dns_auth "s1._domainkey.$domain" TXT | head -1)
   if [[ -z $dkim ]]; then
     warn "DKIM (s1._domainkey)" "не найдена — значение появится в админке Poste.io после создания домена"
   else
     ok "DKIM (s1._domainkey)" "${dkim:0:50}..."
   fi
 
-  local dmarc; dmarc=$(dns_query "_dmarc.$domain" TXT | head -1)
+  local dmarc; dmarc=$(dns_auth "_dmarc.$domain" TXT | head -1)
   if [[ -z $dmarc ]]; then warn "DMARC" "запись _dmarc не найдена"
   else ok "DMARC" "${dmarc:0:70}"; fi
 }
@@ -543,6 +543,36 @@ check_domain_dns() {
 
 # Подсказка: что конкретно сделать, чтобы починить найденную проблему
 hint() { printf '      %s↳ %s%s\n' "$C_DIM" "$1" "$C_OFF"; }
+
+# Авторитативный NS зоны. Проверять записи через системный резолвер нельзя:
+# сразу после правок он ещё отдаёт закэшированное старое состояние, и
+# инструмент рапортует «записи не заданы», хотя они уже есть. Спрашиваем
+# сервер, который за зону отвечает.
+AUTH_NS=''
+
+resolve_auth_ns() {
+  local domain=$1
+  # NS у регистратора — источник, не зависящий ни от какого кэша
+  if [[ -n ${DOMAIN_RDAP_NS:-} && $DOMAIN_RDAP_NS != '-' ]]; then
+    AUTH_NS=${DOMAIN_RDAP_NS%%,*}
+  else
+    # запасной путь — публичный резолвер, он обновляется быстрее провайдерского
+    AUTH_NS=$(dig +short +time=3 +tries=1 @1.1.1.1 NS "$domain" 2>/dev/null \
+              | grep -v '^;' | head -1 | sed 's/\.$//')
+  fi
+  [[ -n $AUTH_NS ]] && info "источник DNS" "$AUTH_NS (авторитативный, в обход кэша)"
+}
+
+# Запрос к авторитативному серверу зоны
+dns_auth() {
+  local name=$1 type=${2:-A}
+  if [[ -n $AUTH_NS ]] && have dig; then
+    dig +short +time=3 +tries=1 "@$AUTH_NS" "$name" "$type" 2>/dev/null \
+      | grep -v '^;' | grep -v '^[[:space:]]*$'
+  else
+    dns_auth "$name" "$type"
+  fi
+}
 
 # Данные о регистрации через RDAP (преемник whois). Отдаёт JSON по HTTP,
 # поэтому не требует установленного whois-клиента.
@@ -706,7 +736,7 @@ check_domain_delegation() {
   head1 "Делегирование $domain"
 
   # SOA — признак того, что зона вообще существует и обслуживается
-  local soa; soa=$(dns_query "$domain" SOA | head -1)
+  local soa; soa=$(dns_auth "$domain" SOA | head -1)
   if [[ -z $soa ]]; then
     fail "зона (SOA)" "не отвечает — домен не делегирован или NS не настроены"
     hint "В панели регистратора укажи NS-серверы своего DNS-провайдера."
@@ -716,7 +746,7 @@ check_domain_delegation() {
   ok "зона (SOA)" "${soa%% *}"
 
   # NS, которые реально отвечают за зону
-  local zone_ns; zone_ns=$(dns_query "$domain" NS | sed 's/\.$//' | sort | tr '\n' ',' | sed 's/,$//')
+  local zone_ns; zone_ns=$(dns_auth "$domain" NS | sed 's/\.$//' | sort | tr '\n' ',' | sed 's/,$//')
   if [[ -z $zone_ns ]]; then
     fail "NS в зоне" "не найдены"
     return 1
@@ -730,15 +760,29 @@ check_domain_delegation() {
     if [[ $DOMAIN_RDAP_NS == "$zone_ns" ]]; then
       ok "NS у регистратора" "совпадают с зоной"
     else
-      warn "NS у регистратора" "${DOMAIN_RDAP_NS//,/ }"
-      hint "Списки NS расходятся. Правки в панели того DNS, который НЕ указан"
-      hint "у регистратора, ни на что не влияют — проверь, где ведёшь зону."
+      # Расхождение бывает двух разных природ, и лечатся они по-разному.
+      # Если NS от регистратора отвечает за зону авторитативно — значит
+      # делегирование уже переехало, а устаревшие данные отдаёт кэш
+      # резолвера. Если не отвечает — зона действительно ведётся не там.
+      local first_ns=${DOMAIN_RDAP_NS%%,*} probe
+      probe=$(dig +short +time=3 +tries=1 "@$first_ns" SOA "$domain" 2>/dev/null | grep -v '^;')
+      if [[ -n $probe ]]; then
+        warn "NS у регистратора" "${DOMAIN_RDAP_NS//,/ }"
+        hint "Делегирование уже переехало на эти серверы, они отвечают за зону."
+        hint "Старые NS показывает кэш резолвера — это пройдёт само по истечении TTL."
+        hint "Проверки ниже идут напрямую к авторитативному серверу, в обход кэша."
+      else
+        warn "NS у регистратора" "${DOMAIN_RDAP_NS//,/ }"
+        hint "Списки NS расходятся, и серверы регистратора за зону не отвечают."
+        hint "Правки в панели того DNS, который НЕ указан у регистратора,"
+        hint "ни на что не влияют — проверь, где ведёшь зону."
+      fi
     fi
   fi
 
   # DNSSEC: при смене DNS-провайдера с включённым DNSSEC и неснятой DS-записью
   # домен перестаёт резолвиться полностью.
-  local ds; ds=$(dns_query "$domain" DS | head -1)
+  local ds; ds=$(dns_auth "$domain" DS | head -1)
   if [[ -n $ds ]]; then
     warn "DNSSEC" "включён (есть DS-запись)"
     hint "Если будешь менять DNS-провайдера — сначала сними DS у регистратора,"
@@ -753,7 +797,7 @@ check_domain_caa() {
   local domain=$1
   head1 "CAA — разрешение на выпуск сертификатов"
 
-  local caa; caa=$(dns_query "$domain" CAA)
+  local caa; caa=$(dns_auth "$domain" CAA)
   if [[ -z $caa ]]; then
     ok "CAA" "не задана — выпуск разрешён любому CA"
     return
@@ -775,7 +819,7 @@ check_domain_existing_mail() {
   head1 "Что уже настроено на $domain"
 
   # Живые MX — главный риск: переключив их, можно оборвать работающую почту
-  local mx; mx=$(dns_query "$domain" MX | sort -n | tr '\n' ';' | sed 's/;$//')
+  local mx; mx=$(dns_auth "$domain" MX | sort -n | tr '\n' ';' | sed 's/;$//')
   if [[ -z $mx ]]; then
     ok "MX" "не заданы — домен почту не обслуживает, конфликта нет"
   else
@@ -784,12 +828,12 @@ check_domain_existing_mail() {
     hint "оборвёт доставку в текущие ящики. Убедись, что домен свободен."
   fi
 
-  local a; a=$(dns_query "$domain" A | head -1)
+  local a; a=$(dns_auth "$domain" A | head -1)
   [[ -n $a ]] && info "A $domain" "$a" || info "A $domain" "не задана"
 
   # Wildcard перехватывает mail./status./portainer. и ломает выпуск
   # сертификатов незаметным образом: имя резолвится, но не туда.
-  local wild; wild=$(dns_query "test-mailstack-probe.$domain" A | head -1)
+  local wild; wild=$(dns_auth "test-mailstack-probe.$domain" A | head -1)
   if [[ -n $wild ]]; then
     warn "wildcard *.$domain" "есть — резолвится в $wild"
     hint "Поддомены mail/status/portainer перехватит wildcard. Задай для них"
@@ -798,12 +842,12 @@ check_domain_existing_mail() {
     ok "wildcard" "нет"
   fi
 
-  local spf; spf=$(dns_query "$domain" TXT | grep -i 'v=spf1' | head -1)
+  local spf; spf=$(dns_auth "$domain" TXT | grep -i 'v=spf1' | head -1)
   [[ -n $spf ]] && warn "SPF (существующий)" "${spf:0:60}" || info "SPF" "не задан"
 
   # TTL важен для миграции: сутки TTL означают сутки расщеплённой доставки
   local ttl
-  ttl=$(dig +noall +answer +time=3 +tries=1 "$domain" SOA 2>/dev/null | awk '{print $2; exit}')
+  ttl=$(dig +noall +answer +time=3 +tries=1 ${AUTH_NS:+@$AUTH_NS} "$domain" SOA 2>/dev/null | awk '{print $2; exit}')
   if [[ -n $ttl ]]; then
     if (( ttl > 3600 )); then
       warn "TTL зоны" "${ttl}s"
@@ -826,6 +870,7 @@ cmd_domain() {
 
   local ip; ip=$(detect_public_ip)
   check_domain_registration "$domain"
+  resolve_auth_ns "$domain"
   if check_domain_delegation "$domain"; then
     check_domain_caa "$domain"
     check_domain_existing_mail "$domain"
@@ -1271,6 +1316,7 @@ cmd_bootstrap() {
   if (( ! skip_domain )); then
     local ip; ip=$(detect_public_ip)
     check_domain_registration "$MAIL_DOMAIN"
+    resolve_auth_ns "$MAIL_DOMAIN"
     if check_domain_delegation "$MAIL_DOMAIN"; then
       check_domain_caa "$MAIL_DOMAIN"
       check_domain_existing_mail "$MAIL_DOMAIN"
