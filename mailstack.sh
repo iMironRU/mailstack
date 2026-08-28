@@ -1028,7 +1028,15 @@ cmd_relay_test() {
 }
 
 cmd_domain() {
-  local domain=${1:-${MAIL_DOMAIN:-}}
+  local domain='' want_ip=''
+  while (( $# )); do
+    case "$1" in
+      --ip) want_ip=${2:-}; shift 2 ;;
+      -*)   die "неизвестный флаг domain: $1" ;;
+      *)    domain=$1; shift ;;
+    esac
+  done
+  : "${domain:=${MAIL_DOMAIN:-}}"
   [[ -n $domain ]] || die "укажи домен: mailstack.sh domain example.com"
   printf '%smailstack domain%s v%s — проверка %s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION" "$domain"
 
@@ -1036,7 +1044,9 @@ cmd_domain() {
     die "нужен dig. Установи: apt-get install -y dnsutils"
   fi
 
-  local ip; ip=$(detect_public_ip)
+  # Без --ip сравниваем с адресом машины, где запущена проверка. Это верно
+  # на самом сервере, но с рабочей машины даёт ложные расхождения.
+  local ip=${want_ip:-$(detect_public_ip)}
   check_domain_registration "$domain"
   resolve_auth_ns "$domain"
   if check_domain_delegation "$domain"; then
@@ -1687,6 +1697,7 @@ ${C_BLD}mailstack.sh${C_OFF} v$MAILSTACK_VERSION — почтовый стек �
 ${C_BLD}Команды${C_OFF}
   preflight          Проверить, можно ли ставить стек на эту машину
   domain DOMAIN      Проверить домен: регистрация, делегирование, CAA, записи
+                     --ip ADDR — с каким адресом сверять A-записи
   bootstrap          Подготовка ОС: swap, Docker, ufw, hostname, fail2ban
   doctor             Диагностика: репутация IP, DNS, порты, контейнеры
   relay-test         Проверить SMTP-релей: соединение, STARTTLS, аутентификация
