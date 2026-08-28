@@ -531,6 +531,44 @@ check_domain_dns() {
   local dmarc; dmarc=$(dns_auth "_dmarc.$domain" TXT | head -1)
   if [[ -z $dmarc ]]; then warn "DMARC" "запись _dmarc не найдена"
   else ok "DMARC" "${dmarc:0:70}"; fi
+
+  check_relay_dkim "$domain"
+}
+
+# DKIM самого релея. Когда почта уходит через smarthost, он подписывает её
+# своим ключом — и у него собственные селекторы, отдельные от s1 у Poste.io.
+# Проверяется вся цепочка CNAME до публичного ключа: запись может быть
+# прописана верно, но указывать на цель, которой у релея ещё нет.
+check_relay_dkim() {
+  local domain=$1
+  [[ -n ${RELAY_HOST:-} ]] || return 0
+
+  local selectors=''
+  case "$RELAY_HOST" in
+    *brevo*)     selectors='brevo1 brevo2' ;;
+    *mailjet*)   selectors='mailjet' ;;
+    *sendgrid*)  selectors='s1 s2' ;;
+    *resend*)    selectors='resend' ;;
+    *) return 0 ;;
+  esac
+
+  local sel target key
+  for sel in $selectors; do
+    target=$(dns_auth "${sel}._domainkey.$domain" CNAME | head -1 | sed 's/\.$//')
+    if [[ -z $target ]]; then
+      warn "DKIM релея ($sel)" "запись не задана"
+      continue
+    fi
+    # Цепочку доводим до конца через публичный резолвер: цель лежит в
+    # чужой зоне, авторитативный сервер нашего домена о ней не знает.
+    key=$(dig +short +time=3 +tries=1 TXT "${sel}._domainkey.$domain" @1.1.1.1 2>/dev/null \
+          | grep -i 'p=' | head -1)
+    if [[ -n $key ]]; then
+      ok "DKIM релея ($sel)" "ключ публикуется"
+    else
+      warn "DKIM релея ($sel)" "$target — цель пока не отдаёт ключ"
+    fi
+  done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
