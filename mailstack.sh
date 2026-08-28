@@ -1267,6 +1267,41 @@ ask_relay() {
 # BOOTSTRAP — подготовка чистой ОС
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Снимок исходного состояния машины — делается ДО любых изменений.
+# Без него откат получается гадательным: неизвестно, на какое имя возвращать
+# hostname, был ли Docker установлен до нас и включал ли кто-то ufw раньше.
+# Всё, чего в снимке нет как «было», uninstall вправе удалить.
+save_state() {
+  mkdir -p "$MAILSTACK_DIR"
+  local f="$MAILSTACK_DIR/.bootstrap-state"
+  cat > "$f" <<CONF
+# Состояние машины до установки. Используется командой uninstall.
+ORIG_HOSTNAME=$(hostname)
+ORIG_FQDN=$(hostname -f 2>/dev/null || hostname)
+HAD_DOCKER=$(have docker && echo 1 || echo 0)
+HAD_SWAP=$(swapon --show 2>/dev/null | grep -q . && echo 1 || echo 0)
+HAD_UFW_ACTIVE=$(ufw status 2>/dev/null | grep -q '^Status: active' && echo 1 || echo 0)
+HAD_FAIL2BAN=$([[ -d /etc/fail2ban ]] && echo 1 || echo 0)
+HAD_DAEMON_JSON=$([[ -f /etc/docker/daemon.json ]] && echo 1 || echo 0)
+BOOTSTRAP_AT=$(date '+%Y-%m-%d %H:%M:%S %Z')
+CONF
+  chmod 600 "$f"
+  ok "снимок состояния" "$f"
+}
+
+load_state() {
+  local f="$MAILSTACK_DIR/.bootstrap-state"
+  if [[ -r $f ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$f"
+    set +a
+    info "снимок состояния" "от ${BOOTSTRAP_AT:-неизвестно}"
+    return 0
+  fi
+  return 1
+}
+
 # Выполнить шаг установки, прервавшись с внятным сообщением при ошибке
 run_step() {
   local desc=$1; shift
@@ -1524,6 +1559,7 @@ cmd_bootstrap() {
   N_PASS=0; N_WARN=0; N_FAIL=0
 
   head1 "Установка"
+  save_state          # снимок делается до первых изменений, иначе откат вслепую
   setup_swap 2048
   run_step "часовой пояс: $TZ_SETTING" timedatectl set-timezone "$TZ_SETTING"
   setup_hostname "$MAIL_HOSTNAME"
@@ -1537,6 +1573,201 @@ cmd_bootstrap() {
   info "следующий шаг" "mailstack.sh deploy"
   [[ -n ${MAIL_DOMAIN:-} ]] && info "проверка домена" "mailstack.sh domain $MAIL_DOMAIN"
   summary "Машина подготовлена" "Установка завершилась с ошибками"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UNINSTALL — откат сделанного
+#
+# Два уровня. Без флагов сносится только стек: контейнеры, тома, каталог
+# установки — то, что нужно для повторной итерации. С --purge откатываются
+# и системные изменения, но лишь те, которых на машине не было до нас:
+# снимок состояния из bootstrap не даёт снести чужой Docker или выключить
+# ufw, включённый кем-то раньше.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAILSTACK_CONTAINERS=(poste npm portainer uptime-kuma autoconfig backrest)
+
+remove_stack() {
+  have docker || { info "стек" "Docker не установлен, удалять нечего"; return; }
+  docker info >/dev/null 2>&1 || { warn "стек" "Docker не отвечает"; return; }
+
+  # Сначала штатная остановка через compose, если файлы на месте
+  local cf via_compose=0
+  for cf in "$MAILSTACK_DIR"/compose/*.yml "$MAILSTACK_DIR"/docker-compose.yml; do
+    [[ -f $cf ]] || continue
+    via_compose=1
+    docker compose -f "$cf" down -v --remove-orphans >/dev/null 2>&1 \
+      && ok "compose down" "$(basename "$cf")" \
+      || warn "compose down" "$(basename "$cf") — не удалось, удалю вручную"
+  done
+
+  # Затем добиваем всё, что осталось с нашими именами
+  local c left=0
+  for c in "${MAILSTACK_CONTAINERS[@]}"; do
+    if docker ps -aq -f "name=^${c}$" 2>/dev/null | grep -q .; then
+      docker rm -f "$c" >/dev/null 2>&1 && ok "контейнер удалён" "$c" || { fail "контейнер" "$c"; left=1; }
+    fi
+  done
+  (( via_compose == 0 && left == 0 )) && info "контейнеры" "наших контейнеров не найдено"
+
+  local v
+  for v in $(docker volume ls -q 2>/dev/null | grep -E '^(mailstack|poste|npm|portainer|uptime|backrest)' || true); do
+    docker volume rm "$v" >/dev/null 2>&1 && ok "том удалён" "$v"
+  done
+
+  docker network rm proxy >/dev/null 2>&1 && ok "сеть удалена" "proxy"
+}
+
+purge_docker() {
+  if (( ${HAD_DOCKER:-0} )); then
+    info "Docker" "был установлен до нас — оставляю"
+    return
+  fi
+  # Без этой проверки отчёт рапортует об удалении того, чего не было
+  if ! have docker && [[ ! -d /var/lib/docker ]]; then
+    info "Docker" "не установлен"
+    return
+  fi
+  # Чужие контейнеры — повод не сносить Docker целиком
+  local others
+  others=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
+  if [[ ${others:-0} -gt 0 ]]; then
+    warn "Docker" "остались посторонние контейнеры ($others) — не удаляю"
+    hint "Удали их сам, если Docker больше не нужен."
+    return
+  fi
+  systemctl stop docker docker.socket containerd >/dev/null 2>&1
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+    >/dev/null 2>&1
+  DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq >/dev/null 2>&1
+  rm -rf /var/lib/docker /var/lib/containerd
+  rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.asc
+  (( ${HAD_DAEMON_JSON:-0} )) || rm -f /etc/docker/daemon.json
+  rmdir /etc/docker 2>/dev/null
+  ok "Docker удалён" "вместе с образами и томами"
+}
+
+purge_swap() {
+  if (( ${HAD_SWAP:-0} )); then
+    info "swap" "был до нас — оставляю"
+    return
+  fi
+  [[ -f /swapfile ]] || { info "swap" "/swapfile отсутствует"; return; }
+  swapoff /swapfile >/dev/null 2>&1
+  rm -f /swapfile
+  sed -i '\|^/swapfile |d' /etc/fstab
+  sed -i '/^vm.swappiness=10$/d' /etc/sysctl.conf
+  ok "swap удалён" "/swapfile, запись в fstab и vm.swappiness"
+}
+
+purge_hostname() {
+  local orig=${ORIG_HOSTNAME:-}
+  if [[ -z $orig ]]; then
+    warn "hostname" "исходное имя неизвестно — оставляю как есть"
+    return
+  fi
+  local current; current=$(hostname)
+  [[ $current == "$orig" ]] && { info "hostname" "$orig — уже исходный"; return; }
+  hostnamectl set-hostname "$orig" >/dev/null 2>&1
+  # Убираем только строку, которую добавляли сами
+  [[ -n ${MAIL_HOSTNAME:-} ]] && sed -i "\|^127\.0\.1\.1[[:space:]].*$MAIL_HOSTNAME|d" /etc/hosts
+  ok "hostname возвращён" "$orig"
+}
+
+purge_firewall() {
+  have ufw || { info "ufw" "не установлен"; return; }
+  if (( ${HAD_UFW_ACTIVE:-0} )); then
+    info "ufw" "был активен до нас — оставляю правила"
+    return
+  fi
+  # reset выключает ufw и очищает правила; политика возвращается к ACCEPT,
+  # поэтому текущая ssh-сессия не рвётся
+  ufw --force reset >/dev/null 2>&1 && ok "ufw сброшен" "правила удалены, файрвол выключен"
+}
+
+purge_fail2ban() {
+  if (( ${HAD_FAIL2BAN:-0} )); then
+    info "fail2ban" "был до нас — оставляю"
+    return
+  fi
+  if [[ ! -d /etc/fail2ban ]] && ! have fail2ban-server; then
+    info "fail2ban" "не установлен"
+    return
+  fi
+  systemctl stop fail2ban >/dev/null 2>&1
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq fail2ban >/dev/null 2>&1
+  rm -rf /etc/fail2ban
+  ok "fail2ban удалён" ""
+}
+
+cmd_uninstall() {
+  local purge=0 keep_env=0
+  while (( $# )); do
+    case "$1" in
+      --purge)    purge=1; shift ;;
+      --keep-env) keep_env=1; shift ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      *) die "неизвестный флаг uninstall: $1" ;;
+    esac
+  done
+
+  printf '%smailstack uninstall%s v%s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION"
+  need_root
+  load_env
+  load_state || warn "снимок состояния" "не найден — системные изменения откатить не смогу"
+
+  head1 "Что будет удалено"
+  info "контейнеры и тома" "почта, настройки NPM, сертификаты — безвозвратно"
+  info "каталог" "$MAILSTACK_DIR"
+  if (( purge )); then
+    (( ${HAD_DOCKER:-0} ))     || info "Docker" "будет удалён вместе с образами"
+    (( ${HAD_SWAP:-0} ))       || info "swap" "/swapfile будет удалён"
+    (( ${HAD_UFW_ACTIVE:-0} )) || info "ufw" "правила будут сброшены, файрвол выключен"
+    (( ${HAD_FAIL2BAN:-0} ))   || info "fail2ban" "будет удалён"
+    [[ -n ${ORIG_HOSTNAME:-} ]] && info "hostname" "вернётся на ${ORIG_HOSTNAME}"
+  else
+    info "системные изменения" "останутся (Docker, swap, ufw) — для --purge укажи флаг"
+  fi
+
+  printf '\n  %sПочтовые данные и сертификаты восстановлению не подлежат.%s\n\n' "$C_YEL" "$C_OFF"
+  confirm "Удалить?" || die "отменено"
+
+  N_PASS=0; N_WARN=0; N_FAIL=0
+
+  head1 "Удаление стека"
+  remove_stack
+
+  # .env хранит креды релея — его сохранение экономит время на повторной
+  # установке, но по умолчанию он всё же удаляется вместе с каталогом.
+  if (( keep_env )) && [[ -f "$MAILSTACK_DIR/.env" ]]; then
+    cp "$MAILSTACK_DIR/.env" "/root/mailstack.env.saved"
+    chmod 600 /root/mailstack.env.saved
+    ok ".env сохранён" "/root/mailstack.env.saved"
+  fi
+
+  if [[ -d $MAILSTACK_DIR ]]; then
+    rm -rf "$MAILSTACK_DIR" && ok "каталог удалён" "$MAILSTACK_DIR"
+  fi
+
+  if (( purge )); then
+    head1 "Откат системных изменений"
+    purge_docker
+    purge_swap
+    purge_hostname
+    purge_firewall
+    purge_fail2ban
+    info "пакеты" "curl, jq, dnsutils, whois оставлены — общесистемные"
+    info "apt upgrade" "откату не подлежит, и в этом нет нужды"
+  fi
+
+  head1 "Готово"
+  if (( purge )); then
+    info "машина" "приведена к состоянию до bootstrap"
+  else
+    info "повторная установка" "mailstack.sh deploy — Docker и swap уже на месте"
+  fi
+  summary "Удаление завершено" "Удаление завершилось с ошибками"
 }
 
 cmd_preflight() {
@@ -1701,6 +1932,7 @@ ${C_BLD}Команды${C_OFF}
   bootstrap          Подготовка ОС: swap, Docker, ufw, hostname, fail2ban
   doctor             Диагностика: репутация IP, DNS, порты, контейнеры
   relay-test         Проверить SMTP-релей: соединение, STARTTLS, аутентификация
+  uninstall          Удалить стек; с --purge — откатить и системные изменения
   deploy             Развернуть стек                                  ${C_DIM}(в работе)${C_OFF}
   update             Обновить образы и систему                        ${C_DIM}(в работе)${C_OFF}
   backup / restore   Резервное копирование в S3 (restic)              ${C_DIM}(в работе)${C_OFF}
@@ -1714,6 +1946,12 @@ ${C_BLD}Флаги bootstrap${C_OFF}
   --skip-domain-check  Не проверять домен перед установкой
   --no-relay         Продолжить без SMTP-релея (только приём почты)
   -y, --yes          Не задавать вопросов (для автоматизации)
+
+${C_BLD}Флаги uninstall${C_OFF}
+  --purge            Откатить и системные изменения: Docker, swap, ufw,
+                     fail2ban, hostname — но только те, которых не было до нас
+  --keep-env         Сохранить .env в /root/mailstack.env.saved
+  -y, --yes          Не спрашивать подтверждения
 
 ${C_BLD}Флаги doctor${C_OFF}
   --external         Проверка снаружи (запускать с рабочей машины, не с сервера)
@@ -1743,6 +1981,7 @@ main() {
     domain)    cmd_domain "$@" ;;
     relay-test) cmd_relay_test "$@" ;;
     bootstrap) cmd_bootstrap "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
     deploy|update|backup|restore|migrate) cmd_todo "$cmd" ;;
     help|--help|-h) usage ;;
     version|--version) echo "mailstack.sh $MAILSTACK_VERSION" ;;
