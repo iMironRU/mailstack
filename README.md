@@ -17,10 +17,12 @@
 | `preflight` | готово |
 | `domain` | готово |
 | `bootstrap` | готово |
+| `deploy` | написан, не проверен на живой машине |
+| `certs-sync` | написан, не проверен |
+| `ssh-key` / `ssh-harden` | готово |
 | `uninstall` | готово |
 | `doctor` | готово |
 | `relay-test` | готово |
-| `deploy` | в работе |
 | `update` | в работе |
 | `backup` / `restore` | в работе |
 | `migrate` | в работе |

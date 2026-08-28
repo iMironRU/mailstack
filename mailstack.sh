@@ -1576,6 +1576,541 @@ cmd_bootstrap() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DEPLOY — генерация compose-файлов и запуск стека
+#
+# Сервисы разнесены по отдельным стекам: перезапуск Poste.io не должен
+# ронять NPM, который держит 443 для всех остальных поддоменов.
+#
+# Админки (NPM, Portainer, Kuma) публикуются только на 127.0.0.1. Закрыть
+# их файрволом нельзя: docker вставляет свои правила в цепочку DOCKER-USER
+# раньше правил ufw, поэтому опубликованный порт остаётся доступен снаружи
+# вопреки «deny» в ufw. Доступ к ним — через ssh-туннель.
+# ─────────────────────────────────────────────────────────────────────────────
+
+COMPOSE_DIR=''
+
+write_compose_npm() {
+  cat > "$COMPOSE_DIR/10-npm.yml" <<'YML'
+# Nginx Proxy Manager — единственный владелец 80 и 443.
+# Он же выпускает сертификаты Let's Encrypt для всех поддоменов.
+services:
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: npm
+    restart: unless-stopped
+    ports:
+      - "80:80"        # HTTP: ACME-проверка Let's Encrypt и редирект на HTTPS
+      - "443:443"      # HTTPS: webmail, админки, autoconfig
+      - "127.0.0.1:81:81"   # админка NPM — только локально, доступ через ssh-туннель
+    volumes:
+      - npm_data:/data
+      - npm_letsencrypt:/etc/letsencrypt
+    environment:
+      - TZ=${TZ}
+      - DISABLE_IPV6=true
+    networks: [proxy]
+    healthcheck:
+      test: ["CMD", "/usr/bin/check-health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  npm_data:
+    name: mailstack_npm_data
+  npm_letsencrypt:
+    name: mailstack_npm_letsencrypt
+
+networks:
+  proxy:
+    external: true
+YML
+}
+
+write_compose_portainer() {
+  cat > "$COMPOSE_DIR/20-portainer.yml" <<'YML'
+# Portainer — управление Docker через веб.
+# Публикуется порт 9000 (HTTP), а не 9443: за NPM шифрование уже есть,
+# а самоподписанный сертификат на 9443 потребовал бы отключать проверку
+# сертификата в настройках прокси.
+services:
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"   # только локально, наружу — через NPM
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    environment:
+      - TZ=${TZ}
+    networks: [proxy]
+
+volumes:
+  portainer_data:
+    name: mailstack_portainer_data
+
+networks:
+  proxy:
+    external: true
+YML
+}
+
+write_compose_poste() {
+  cat > "$COMPOSE_DIR/30-poste.yml" <<'YML'
+# Poste.io — Postfix + Dovecot + Rspamd + Roundcube в одном контейнере.
+#
+# Порты 80/443 НЕ публикуются: их держит NPM, который проксирует веб-морду
+# на внутренний порт 80 этого контейнера.
+#
+# Почтовые порты публикуются напрямую — reverse-proxy их не обслуживает,
+# TLS для них терминирует сам Dovecot/Postfix внутри контейнера. Отсюда
+# требование к сертификату в /data/ssl, который кладёт команда certs-sync.
+services:
+  poste:
+    image: analogic/poste.io:latest
+    container_name: poste
+    restart: unless-stopped
+    hostname: ${MAIL_HOSTNAME}
+    ports:
+      - "25:25"      # SMTP — приём почты от других серверов
+      - "465:465"    # SMTPS — отправка клиентом, implicit TLS
+      - "587:587"    # Submission — отправка клиентом, STARTTLS
+      - "993:993"    # IMAPS — чтение почты
+      - "995:995"    # POP3S — чтение почты
+    volumes:
+      - poste_data:/data
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=${TZ}
+      # HTTPS=OFF — шифрование веб-морды берёт на себя NPM, а редиректы
+      # изнутри контейнера ломали бы проксирование
+      - HTTPS=OFF
+      # ClamAV отключён ради экономии памяти: он один съедает больше,
+      # чем весь остальной стек. Rspamd остаётся включённым
+      - DISABLE_CLAMAV=TRUE
+      - VIRTUAL_HOST=${MAIL_HOSTNAME}
+    networks: [proxy]
+
+volumes:
+  poste_data:
+    name: mailstack_poste_data
+
+networks:
+  proxy:
+    external: true
+YML
+}
+
+write_compose_kuma() {
+  cat > "$COMPOSE_DIR/40-kuma.yml" <<'YML'
+# Uptime Kuma — мониторинг доступности сервисов и почтовых портов
+services:
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"   # только локально, наружу — через NPM
+    volumes:
+      - kuma_data:/app/data
+    environment:
+      - TZ=${TZ}
+    networks: [proxy]
+
+volumes:
+  kuma_data:
+    name: mailstack_kuma_data
+
+networks:
+  proxy:
+    external: true
+YML
+}
+
+write_compose_autoconfig() {
+  local dir="$MAILSTACK_DIR/autoconfig"
+  mkdir -p "$dir"
+
+  # Thunderbird: Mozilla autoconfig
+  cat > "$dir/config-v1.1.xml" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<clientConfig version="1.1">
+  <emailProvider id="${MAIL_DOMAIN}">
+    <domain>${MAIL_DOMAIN}</domain>
+    <displayName>${MAIL_DOMAIN}</displayName>
+    <displayShortName>${MAIL_DOMAIN}</displayShortName>
+    <incomingServer type="imap">
+      <hostname>${MAIL_HOSTNAME}</hostname>
+      <port>993</port>
+      <socketType>SSL</socketType>
+      <authentication>password-cleartext</authentication>
+      <username>%EMAILADDRESS%</username>
+    </incomingServer>
+    <outgoingServer type="smtp">
+      <hostname>${MAIL_HOSTNAME}</hostname>
+      <port>465</port>
+      <socketType>SSL</socketType>
+      <authentication>password-cleartext</authentication>
+      <username>%EMAILADDRESS%</username>
+    </outgoingServer>
+  </emailProvider>
+</clientConfig>
+XML
+
+  # Outlook: Microsoft autodiscover
+  cat > "$dir/autodiscover.xml" <<XML
+<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">
+  <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a">
+    <Account>
+      <AccountType>email</AccountType>
+      <Action>settings</Action>
+      <Protocol>
+        <Type>IMAP</Type>
+        <Server>${MAIL_HOSTNAME}</Server>
+        <Port>993</Port>
+        <SSL>on</SSL>
+        <SPA>off</SPA>
+        <AuthRequired>on</AuthRequired>
+      </Protocol>
+      <Protocol>
+        <Type>SMTP</Type>
+        <Server>${MAIL_HOSTNAME}</Server>
+        <Port>465</Port>
+        <SSL>on</SSL>
+        <SPA>off</SPA>
+        <AuthRequired>on</AuthRequired>
+      </Protocol>
+    </Account>
+  </Response>
+</Autodiscover>
+XML
+
+  cat > "$dir/nginx.conf" <<'CONF'
+server {
+    listen 80;
+    server_name _;
+
+    root /srv/autoconfig;
+    default_type application/xml;
+
+    # Outlook обращается к autodiscover методом POST, а nginx на POST к
+    # статическому файлу отвечает 405. Это самая частая причина, по которой
+    # самописный autodiscover «не работает без видимых ошибок».
+    error_page 405 =200 $uri;
+
+    location = /mail/config-v1.1.xml {
+        alias /srv/autoconfig/config-v1.1.xml;
+    }
+
+    # Второй путь Thunderbird — через well-known на самом домене
+    location = /.well-known/autoconfig/mail/config-v1.1.xml {
+        alias /srv/autoconfig/config-v1.1.xml;
+    }
+
+    location = /autodiscover/autodiscover.xml {
+        alias /srv/autoconfig/autodiscover.xml;
+    }
+
+    # Outlook пишет путь в разном регистре
+    location = /Autodiscover/Autodiscover.xml {
+        alias /srv/autoconfig/autodiscover.xml;
+    }
+
+    location = /healthz {
+        add_header Content-Type text/plain;
+        return 200 'ok';
+    }
+
+    location / { return 404; }
+}
+CONF
+
+  cat > "$COMPOSE_DIR/50-autoconfig.yml" <<'YML'
+# Автонастройка почтовых клиентов: Thunderbird (autoconfig) и Outlook
+# (autodiscover). Наружу не публикуется — только через NPM на поддоменах
+# autoconfig.<домен> и autodiscover.<домен>.
+services:
+  autoconfig:
+    image: nginx:alpine
+    container_name: autoconfig
+    restart: unless-stopped
+    volumes:
+      - ${MAILSTACK_DIR}/autoconfig/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${MAILSTACK_DIR}/autoconfig/config-v1.1.xml:/srv/autoconfig/config-v1.1.xml:ro
+      - ${MAILSTACK_DIR}/autoconfig/autodiscover.xml:/srv/autoconfig/autodiscover.xml:ro
+    environment:
+      - TZ=${TZ}
+    networks: [proxy]
+
+networks:
+  proxy:
+    external: true
+YML
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Сертификаты для SMTP/IMAP
+#
+# NPM терминирует TLS только для HTTP. Порты 465/993 и STARTTLS на 587
+# обслуживают Postfix и Dovecot внутри контейнера Poste.io, и им нужен
+# сертификат в собственной файловой системе. Сам Poste.io получить его не
+# может — порт 80 занят NPM, поэтому копируем выпущенный NPM сертификат.
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_certs_sync() {
+  printf '%smailstack certs-sync%s v%s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION"
+  need_root
+  load_env
+  local host=${MAIL_HOSTNAME:-mail.${MAIL_DOMAIN:-}}
+  [[ -n ${MAIL_DOMAIN:-} ]] || die "не задан MAIL_DOMAIN — запусти bootstrap"
+
+  head1 "Поиск сертификата для $host"
+  have docker || die "Docker не установлен"
+
+  # NPM хранит сертификаты как npm-<N>; какой из них наш — определяем по
+  # содержимому, а не по номеру: номера меняются при перевыпуске
+  local cert_dir=''
+  local dirs; dirs=$(docker run --rm -v mailstack_npm_letsencrypt:/le alpine:latest \
+                     sh -c 'ls -1 /le/live 2>/dev/null' 2>/dev/null)
+  local d
+  for d in $dirs; do
+    [[ $d == README ]] && continue
+    local cn
+    cn=$(docker run --rm -v mailstack_npm_letsencrypt:/le alpine:latest \
+         sh -c "openssl x509 -in /le/live/$d/fullchain.pem -noout -text 2>/dev/null | grep -o 'DNS:[^,]*'" 2>/dev/null)
+    if grep -q "DNS:$host" <<<"$cn"; then
+      cert_dir=$d
+      ok "сертификат найден" "$d"
+      break
+    fi
+  done
+
+  if [[ -z $cert_dir ]]; then
+    fail "сертификат" "для $host не найден в NPM"
+    hint "Сначала создай в NPM proxy host для $host и выпусти сертификат."
+    hint "Порты 465/993 без него работать не будут — клиенты получат ошибку TLS."
+    summary "" "Сертификат не готов"
+    return 1
+  fi
+
+  head1 "Копирование в Poste.io"
+  docker ps -q -f name=^poste$ | grep -q . || { fail "poste" "контейнер не запущен"; return 1; }
+
+  local tmp; tmp=$(mktemp -d)
+  docker run --rm -v mailstack_npm_letsencrypt:/le -v "$tmp:/out" alpine:latest \
+    sh -c "cp /le/live/$cert_dir/fullchain.pem /out/server.crt && cp /le/live/$cert_dir/privkey.pem /out/server.key" \
+    >/dev/null 2>&1 || { fail "чтение сертификата" "не удалось"; rm -rf "$tmp"; return 1; }
+
+  # Сравниваем с уже установленным: перезапускать почтовые службы на каждый
+  # прогон незачем, это разрывает активные сессии клиентов
+  local new_fp old_fp
+  new_fp=$(openssl x509 -in "$tmp/server.crt" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+  old_fp=$(docker exec poste sh -c 'openssl x509 -in /data/ssl/server.crt -noout -fingerprint -sha256 2>/dev/null' 2>/dev/null | cut -d= -f2)
+
+  if [[ -n $old_fp && $new_fp == "$old_fp" ]]; then
+    ok "сертификат" "уже актуален, перезапуск не нужен"
+    rm -rf "$tmp"
+    summary "Сертификаты в порядке" ""
+    return 0
+  fi
+
+  docker exec poste mkdir -p /data/ssl >/dev/null 2>&1
+  docker cp "$tmp/server.crt" poste:/data/ssl/server.crt >/dev/null 2>&1 \
+    && docker cp "$tmp/server.key" poste:/data/ssl/server.key >/dev/null 2>&1 \
+    && ok "сертификат скопирован" "/data/ssl" \
+    || { fail "копирование" "не удалось"; rm -rf "$tmp"; return 1; }
+  docker exec poste chmod 600 /data/ssl/server.key >/dev/null 2>&1
+  rm -rf "$tmp"
+
+  # Перечитывают конфигурацию без разрыва установленных соединений
+  docker exec poste sh -c 'supervisorctl restart dovecot postfix 2>/dev/null || true' >/dev/null 2>&1
+  ok "dovecot и postfix" "перезапущены с новым сертификатом"
+
+  summary "Сертификаты синхронизированы" "Синхронизация не удалась"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSH: ключи вместо пароля
+#
+# Имя файла начинается с 01 не для красоты. В OpenSSH выигрывает ПЕРВОЕ
+# вхождение параметра, а Include в sshd_config стоит раньше большинства
+# директив. Облачные образы кладут туда 50-cloud-init.conf с
+# PasswordAuthentication yes, и файл с именем 99-* проиграл бы ему: отчёт
+# сообщил бы об успехе, а вход по паролю продолжал бы работать.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SSHD_DROPIN=/etc/ssh/sshd_config.d/01-mailstack.conf
+
+ssh_add_key() {
+  local src=$1 key=''
+
+  if [[ $src == http*://* ]]; then
+    key=$(curl -fsSL --max-time 15 "$src" 2>/dev/null)
+  elif [[ -r $src ]]; then
+    key=$(cat "$src")
+  else
+    # Строку с самим ключом тоже принимаем
+    key=$src
+  fi
+
+  # Валидируем именно как публичный ключ: мусор в authorized_keys приведёт
+  # к отказу входа, который потом долго ищут
+  local tmp; tmp=$(mktemp)
+  printf '%s\n' "$key" > "$tmp"
+  if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    fail "публичный ключ" "не распознан: ${src:0:60}"
+    return 1
+  fi
+  local fp; fp=$(ssh-keygen -l -f "$tmp" 2>/dev/null | head -1)
+  rm -f "$tmp"
+
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  touch /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+
+  if grep -qxF "$key" /root/.ssh/authorized_keys 2>/dev/null; then
+    ok "ключ уже добавлен" "$fp"
+  else
+    printf '%s\n' "$key" >> /root/.ssh/authorized_keys
+    ok "ключ добавлен" "$fp"
+  fi
+  return 0
+}
+
+ssh_count_keys() {
+  [[ -f /root/.ssh/authorized_keys ]] || { echo 0; return; }
+  # grep -c печатает число и БЕЗ совпадений, но выходит с кодом 1.
+  # Ветка || echo 0 дописывала вторую строку — получалось "0\n0", и
+  # арифметическое сравнение падало, пропуская защиту.
+  local n
+  n=$(grep -cvE '^[[:space:]]*(#|$)' /root/.ssh/authorized_keys 2>/dev/null)
+  n=${n//[^0-9]/}
+  echo "${n:-0}"
+}
+
+cmd_ssh_key() {
+  printf '%smailstack ssh-key%s v%s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION"
+  need_root
+  [[ $# -gt 0 ]] || die "укажи ключ: mailstack.sh ssh-key ~/.ssh/id_ed25519.pub | URL | 'ssh-ed25519 AAAA...'"
+  head1 "Добавление публичного ключа"
+  local a
+  for a in "$@"; do ssh_add_key "$a"; done
+  info "ключей в authorized_keys" "$(ssh_count_keys)"
+  head1 "Дальше"
+  info "1. проверь вход" "ssh -i <приватный ключ> root@<адрес>"
+  info "2. отключи пароль" "mailstack.sh ssh-harden"
+  summary "Ключ на месте" "Ключ добавить не удалось"
+}
+
+cmd_ssh_harden() {
+  local confirm_only=0 rollback=0 minutes=10 TESTED_KEY=0
+  while (( $# )); do
+    case "$1" in
+      --confirm)  confirm_only=1; shift ;;
+      --i-tested-key-login) TESTED_KEY=1; shift ;;
+      --rollback) rollback=1; shift ;;
+      --timeout)  minutes=${2:-10}; shift 2 ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      *) die "неизвестный флаг ssh-harden: $1" ;;
+    esac
+  done
+
+  printf '%smailstack ssh-harden%s v%s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION"
+  need_root
+
+  if (( confirm_only )); then
+    # Отменяем автооткат — значит вход по ключу подтверждён
+    systemctl stop mailstack-ssh-rollback.timer >/dev/null 2>&1
+    systemctl reset-failed mailstack-ssh-rollback.timer mailstack-ssh-rollback.service >/dev/null 2>&1
+    head1 "Подтверждено"
+    ok "автооткат отменён" "парольный вход остаётся отключённым"
+    summary "Готово" ""
+  fi
+
+  if (( rollback )); then
+    rm -f "$SSHD_DROPIN"
+    systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1
+    head1 "Откат"
+    ok "парольный вход восстановлен" "$(sshd -T 2>/dev/null | grep '^passwordauthentication')"
+    summary "Откат выполнен" ""
+  fi
+
+  head1 "Проверка перед отключением пароля"
+  local n; n=$(ssh_count_keys)
+  if [[ ${n:-0} -lt 1 ]]; then
+    fail "authorized_keys" "ключей нет — отключать пароль нельзя"
+    hint "Сначала добавь ключ: mailstack.sh ssh-key <файл|URL>"
+    die "нет ни одного публичного ключа"
+  fi
+  ok "authorized_keys" "$n ключ(ей)"
+  info "текущее значение" "$(sshd -T 2>/dev/null | grep '^passwordauthentication')"
+
+  printf '\n  %sОтключение пароля до проверки входа по ключу запирает снаружи.%s\n' "$C_YEL" "$C_OFF"
+  printf '  Убедись в другом терминале, что вход по ключу работает.\n\n'
+  # ASSUME_YES сюда намеренно не пускаем: этот шаг при ошибке отрезает
+  # доступ к машине, поэтому требует либо живого человека у терминала,
+  # либо отдельного явного флага.
+  if (( TESTED_KEY )); then
+    info "подтверждение" "--i-tested-key-login"
+  elif has_tty; then
+    local ans
+    printf '  %s?%s Вход по ключу проверен, отключаем пароль? [y/N]: ' "$C_BLU" "$C_OFF" > /dev/tty
+    IFS= read -r ans < /dev/tty || ans=''
+    [[ $ans =~ ^[yYдД] ]] || die "отменено"
+  else
+    die "нет терминала. Для неинтерактивного запуска нужен флаг --i-tested-key-login"
+  fi
+
+  cat > "$SSHD_DROPIN" <<'CONF'
+# mailstack: вход только по ключу.
+# Имя файла начинается с 01 намеренно — в OpenSSH выигрывает первое
+# вхождение параметра, а 50-cloud-init.conf включает пароль обратно.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+CONF
+  chmod 644 "$SSHD_DROPIN"
+
+  if ! sshd -t 2>/tmp/sshd-test.log; then
+    fail "конфигурация sshd" "не проходит проверку"
+    sed 's/^/        /' /tmp/sshd-test.log
+    rm -f "$SSHD_DROPIN"
+    die "конфиг откачен, ничего не изменено"
+  fi
+  ok "конфигурация sshd" "синтаксис корректен"
+
+  # reload, а не restart: перезагрузка конфига не рвёт текущие сессии
+  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1
+  local eff; eff=$(sshd -T 2>/dev/null | grep '^passwordauthentication')
+  if [[ $eff == *no ]]; then
+    ok "парольный вход" "отключён ($eff)"
+  else
+    fail "парольный вход" "всё ещё включён ($eff)"
+    hint "Проверь порядок файлов в /etc/ssh/sshd_config.d/ — выигрывает первый."
+  fi
+
+  # Страховка: если вход по ключу всё-таки не работает, конфиг вернётся сам
+  systemd-run --unit=mailstack-ssh-rollback --on-active="${minutes}min" \
+    /bin/bash -c "rm -f $SSHD_DROPIN; systemctl reload ssh 2>/dev/null || systemctl reload sshd" \
+    >/dev/null 2>&1 \
+    && ok "автооткат" "через ${minutes} мин, если не подтвердить" \
+    || warn "автооткат" "не удалось запланировать — откат только вручную"
+
+  head1 "Важно"
+  printf '  %sСейчас открой НОВОЕ соединение по ключу и проверь вход.%s\n' "$C_BLD" "$C_OFF"
+  info "получилось" "mailstack.sh ssh-harden --confirm   (отменит автооткат)"
+  info "не получилось" "ничего не делай — через ${minutes} мин пароль вернётся сам"
+  info "откатить сразу" "mailstack.sh ssh-harden --rollback"
+  summary "Пароль отключён, автооткат взведён" "Есть проблемы"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # UNINSTALL — откат сделанного
 #
 # Два уровня. Без флагов сносится только стек: контейнеры, тома, каталог
@@ -1701,6 +2236,13 @@ purge_fail2ban() {
   ok "fail2ban удалён" ""
 }
 
+purge_ssh_hardening() {
+  [[ -f $SSHD_DROPIN ]] || { info "ssh" "парольный вход не отключался"; return; }
+  rm -f "$SSHD_DROPIN"
+  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1
+  ok "ssh" "парольный вход восстановлен"
+}
+
 cmd_uninstall() {
   local purge=0 keep_env=0
   while (( $# )); do
@@ -1757,6 +2299,7 @@ cmd_uninstall() {
     purge_hostname
     purge_firewall
     purge_fail2ban
+    purge_ssh_hardening
     info "пакеты" "curl, jq, dnsutils, whois оставлены — общесистемные"
     info "apt upgrade" "откату не подлежит, и в этом нет нужды"
   fi
@@ -1768,6 +2311,130 @@ cmd_uninstall() {
     info "повторная установка" "mailstack.sh deploy — Docker и swap уже на месте"
   fi
   summary "Удаление завершено" "Удаление завершилось с ошибками"
+}
+
+compose_up() {
+  local file=$1 name=$2
+  docker compose --env-file "$MAILSTACK_DIR/.env" -f "$file" up -d >/tmp/mailstack-up.log 2>&1 \
+    && ok "$name" "запущен" \
+    || { fail "$name" "не запустился"; sed 's/^/        /' /tmp/mailstack-up.log | tail -6; return 1; }
+}
+
+# Ждём, пока контейнер действительно начнёт отвечать. Docker сообщает
+# «running» сразу после старта процесса, задолго до готовности сервиса,
+# и следующий шаг по этому признаку запускать рано.
+wait_for_port() {
+  local host=$1 port=$2 name=$3 tries=${4:-30}
+  local i
+  for (( i = 1; i <= tries; i++ )); do
+    if tcp_probe "$host" "$port" 2; then
+      ok "$name" "отвечает на $host:$port"
+      return 0
+    fi
+    sleep 2
+  done
+  warn "$name" "не ответил за $((tries * 2)) с — проверь логи"
+  return 1
+}
+
+cmd_deploy() {
+  local do_pull=0
+  while (( $# )); do
+    case "$1" in
+      --pull)   do_pull=1; shift ;;
+      -y|--yes) ASSUME_YES=1; shift ;;
+      *) die "неизвестный флаг deploy: $1" ;;
+    esac
+  done
+
+  printf '%smailstack deploy%s v%s — %s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION" "$(date '+%Y-%m-%d %H:%M')"
+  need_root
+  load_env
+
+  [[ -n ${MAIL_DOMAIN:-} ]]   || die "не задан MAIL_DOMAIN — сначала выполни bootstrap"
+  [[ -n ${MAIL_HOSTNAME:-} ]] || MAIL_HOSTNAME="mail.$MAIL_DOMAIN"
+  : "${TZ:=UTC}"
+  export TZ MAIL_DOMAIN MAIL_HOSTNAME MAILSTACK_DIR
+
+  have docker || die "Docker не установлен — сначала выполни bootstrap"
+  docker info >/dev/null 2>&1 || die "Docker не отвечает"
+
+  COMPOSE_DIR="$MAILSTACK_DIR/compose"
+  mkdir -p "$COMPOSE_DIR"
+
+  head1 "Параметры"
+  info "домен" "$MAIL_DOMAIN"
+  info "почтовый хост" "$MAIL_HOSTNAME"
+  info "часовой пояс" "$TZ"
+  info "каталог" "$MAILSTACK_DIR"
+  if [[ -n ${RELAY_HOST:-} ]]; then
+    info "SMTP-релей" "$RELAY_HOST:${RELAY_PORT:-587}"
+  else
+    warn "SMTP-релей" "не настроен — отправка наружу возможна только при открытом 25"
+  fi
+
+  head1 "Генерация compose-файлов"
+  write_compose_npm        && ok "10-npm.yml" "NPM — 80, 443, админка на 127.0.0.1:81"
+  write_compose_portainer  && ok "20-portainer.yml" "Portainer — 127.0.0.1:9000"
+  write_compose_poste      && ok "30-poste.yml" "Poste.io — 25, 465, 587, 993, 995"
+  write_compose_kuma       && ok "40-kuma.yml" "Uptime Kuma — 127.0.0.1:3001"
+  write_compose_autoconfig && ok "50-autoconfig.yml" "autoconfig/autodiscover"
+
+  head1 "Сеть"
+  if docker network inspect proxy >/dev/null 2>&1; then
+    ok "сеть proxy" "уже существует"
+  else
+    docker network create proxy >/dev/null 2>&1 && ok "сеть proxy" "создана" \
+      || { fail "сеть proxy" "не создана"; die "без общей сети сервисы не увидят друг друга"; }
+  fi
+
+  if (( do_pull )); then
+    head1 "Загрузка образов"
+    local f
+    for f in "$COMPOSE_DIR"/*.yml; do
+      docker compose --env-file "$MAILSTACK_DIR/.env" -f "$f" pull >/dev/null 2>&1 \
+        && ok "$(basename "$f")" "образы обновлены" \
+        || warn "$(basename "$f")" "не удалось обновить образы"
+    done
+  fi
+
+  head1 "Запуск"
+  # NPM первым: он владеет 80 и 443, и если порты заняты — остальное
+  # поднимать бессмысленно
+  compose_up "$COMPOSE_DIR/10-npm.yml" "npm" || die "NPM не запустился, дальше нет смысла"
+  wait_for_port 127.0.0.1 81 "админка NPM" 30
+
+  compose_up "$COMPOSE_DIR/20-portainer.yml" "portainer"
+  compose_up "$COMPOSE_DIR/30-poste.yml" "poste"
+  compose_up "$COMPOSE_DIR/40-kuma.yml" "uptime-kuma"
+  compose_up "$COMPOSE_DIR/50-autoconfig.yml" "autoconfig"
+
+  head1 "Готовность сервисов"
+  # Poste.io при первом запуске разворачивает базу и генерирует ключи —
+  # это заметно дольше остальных контейнеров
+  wait_for_port 127.0.0.1 25 "poste (SMTP)" 60
+  wait_for_port 127.0.0.1 9000 "portainer" 20
+  wait_for_port 127.0.0.1 3001 "uptime-kuma" 20
+
+  head1 "Что дальше"
+  printf '  %s1.%s Админка NPM — только локально, поэтому через ssh-туннель:\n' "$C_BLD" "$C_OFF"
+  printf '     ssh -L 8181:127.0.0.1:81 root@<адрес сервера>\n'
+  printf '     затем http://localhost:8181  —  вход admin@example.com / changeme\n'
+  printf '     %sпароль меняется при первом входе%s\n\n' "$C_YEL" "$C_OFF"
+  printf '  %s2.%s Создать в NPM proxy hosts (Add Proxy Host → вкладка SSL → Request new certificate):\n' "$C_BLD" "$C_OFF"
+  printf '     %-28s → poste:80\n'        "$MAIL_HOSTNAME"
+  printf '     %-28s → uptime-kuma:3001\n' "status.$MAIL_DOMAIN"
+  printf '     %-28s → portainer:9000\n'   "portainer.$MAIL_DOMAIN"
+  printf '     %-28s → autoconfig:80\n'    "autoconfig.$MAIL_DOMAIN"
+  printf '     %-28s → autoconfig:80\n\n'  "autodiscover.$MAIL_DOMAIN"
+  printf '  %s3.%s Подтянуть сертификат в Poste.io — иначе порты 465 и 993\n' "$C_BLD" "$C_OFF"
+  printf '     отдадут клиентам ошибку TLS:\n'
+  printf '     mailstack.sh certs-sync\n\n'
+  printf '  %s4.%s Создать домен и первый ящик в админке https://%s\n' "$C_BLD" "$C_OFF" "$MAIL_HOSTNAME"
+  printf '     Там же появится значение DKIM для записи s1._domainkey\n\n'
+  printf '  %s5.%s Добавить MX: %s  MX 10 %s\n\n' "$C_BLD" "$C_OFF" "$MAIL_DOMAIN" "$MAIL_HOSTNAME"
+
+  summary "Стек запущен" "Запуск завершился с ошибками"
 }
 
 cmd_preflight() {
@@ -1932,8 +2599,11 @@ ${C_BLD}Команды${C_OFF}
   bootstrap          Подготовка ОС: swap, Docker, ufw, hostname, fail2ban
   doctor             Диагностика: репутация IP, DNS, порты, контейнеры
   relay-test         Проверить SMTP-релей: соединение, STARTTLS, аутентификация
+  ssh-key FILE|URL   Добавить публичный ключ в authorized_keys
+  ssh-harden         Отключить вход по паролю (только после проверки ключа)
   uninstall          Удалить стек; с --purge — откатить и системные изменения
-  deploy             Развернуть стек                                  ${C_DIM}(в работе)${C_OFF}
+  deploy             Развернуть стек (--pull — обновить образы)
+  certs-sync         Подтянуть сертификат из NPM в Poste.io для SMTP/IMAP
   update             Обновить образы и систему                        ${C_DIM}(в работе)${C_OFF}
   backup / restore   Резервное копирование в S3 (restic)              ${C_DIM}(в работе)${C_OFF}
   migrate            Переезд на другую виртуалку                      ${C_DIM}(в работе)${C_OFF}
@@ -1946,6 +2616,11 @@ ${C_BLD}Флаги bootstrap${C_OFF}
   --skip-domain-check  Не проверять домен перед установкой
   --no-relay         Продолжить без SMTP-релея (только приём почты)
   -y, --yes          Не задавать вопросов (для автоматизации)
+
+${C_BLD}Флаги ssh-harden${C_OFF}
+  --confirm          Подтвердить, что вход по ключу работает (отменяет автооткат)
+  --rollback         Немедленно вернуть парольный вход
+  --timeout MIN      Через сколько минут сработает автооткат (по умолчанию 10)
 
 ${C_BLD}Флаги uninstall${C_OFF}
   --purge            Откатить и системные изменения: Docker, swap, ufw,
@@ -1982,7 +2657,11 @@ main() {
     relay-test) cmd_relay_test "$@" ;;
     bootstrap) cmd_bootstrap "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
-    deploy|update|backup|restore|migrate) cmd_todo "$cmd" ;;
+    ssh-key)    cmd_ssh_key "$@" ;;
+    ssh-harden) cmd_ssh_harden "$@" ;;
+    deploy)     cmd_deploy "$@" ;;
+    certs-sync) cmd_certs_sync "$@" ;;
+    update|backup|restore|migrate) cmd_todo "$cmd" ;;
     help|--help|-h) usage ;;
     version|--version) echo "mailstack.sh $MAILSTACK_VERSION" ;;
     *) usage; exit 1 ;;
