@@ -1576,6 +1576,488 @@ cmd_bootstrap() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BACKUP — restic
+#
+# Настройка намеренно не входит в deploy: развёртывание не должно упираться
+# в неготовое хранилище. Репозиторий подключается в любой момент.
+#
+# Тома бэкапятся прямо из /var/lib/docker/volumes — без промежуточной
+# распаковки в tar, которая требовала бы вдвое больше места на диске.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RESTIC_PW_FILE=''
+RESTIC_ENV_FILE=''
+
+restic_paths() {
+  # Тома стека плюс каталог с compose-файлами, .env и конфигами autoconfig
+  local v
+  for v in /var/lib/docker/volumes/mailstack_*; do
+    [[ -d $v/_data ]] && echo "$v/_data"
+  done
+  [[ -d $MAILSTACK_DIR ]] && echo "$MAILSTACK_DIR"
+}
+
+ensure_restic() {
+  if have restic; then
+    info "restic" "$(restic version 2>/dev/null | awk '{print $2}')"
+    return 0
+  fi
+  info "restic" "устанавливаю"
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq restic >/dev/null 2>&1
+  have restic || die "не удалось установить restic"
+  ok "restic установлен" "$(restic version 2>/dev/null | awk '{print $2}')"
+}
+
+# Окружение для вызова restic: пароль репозитория и, для S3, ключи доступа
+restic_env() {
+  RESTIC_PW_FILE="$MAILSTACK_DIR/.restic-password"
+  RESTIC_ENV_FILE="$MAILSTACK_DIR/.restic-env"
+  [[ -r $RESTIC_PW_FILE ]] || return 1
+  export RESTIC_PASSWORD_FILE="$RESTIC_PW_FILE"
+  export RESTIC_REPOSITORY="${RESTIC_REPOSITORY:-}"
+  if [[ -r $RESTIC_ENV_FILE ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$RESTIC_ENV_FILE"
+    set +a
+  fi
+  [[ -n $RESTIC_REPOSITORY ]]
+}
+
+backup_configured() {
+  [[ -n ${RESTIC_REPOSITORY:-} ]] && [[ -r "$MAILSTACK_DIR/.restic-password" ]]
+}
+
+cmd_backup_setup() {
+  local repo='' kind=''
+  while (( $# )); do
+    case "$1" in
+      --repo) repo=${2:-}; shift 2 ;;
+      -y|--yes) ASSUME_YES=1; shift ;;
+      *) die "неизвестный флаг: $1" ;;
+    esac
+  done
+
+  head1 "Настройка резервного копирования"
+  ensure_restic
+
+  if [[ -z $repo ]]; then
+    if ! has_tty; then
+      die "укажи хранилище флагом --repo (примеры см. в .env)"
+    fi
+    printf '\n  Куда складывать бэкапы:\n\n'
+    printf '    %s1%s  SFTP на другой сервер   %sнативно, по ssh, без лишних слоёв%s\n' "$C_BLD" "$C_OFF" "$C_DIM" "$C_OFF"
+    printf '    %s2%s  Локальный каталог       %sбыстро, но не переживёт потерю сервера%s\n' "$C_BLD" "$C_OFF" "$C_DIM" "$C_OFF"
+    printf '    %s3%s  S3                      %sSelectel, Backblaze B2, MinIO, Yandex%s\n' "$C_BLD" "$C_OFF" "$C_DIM" "$C_OFF"
+    printf '    %s4%s  rclone                  %sвсё остальное: FTP, WebDAV, Диск%s\n\n' "$C_BLD" "$C_OFF" "$C_DIM" "$C_OFF"
+    local choice
+    printf '  %s?%s Вариант [1-4]: ' "$C_BLU" "$C_OFF" > /dev/tty
+    IFS= read -r choice < /dev/tty || choice=''
+    case "$choice" in
+      1) kind=sftp;   ask repo "SFTP-путь (user@host:/путь)" ;;
+      2) kind=local;  ask repo "Каталог" "/mnt/backup/mailstack" ;;
+      3) kind=s3;     ask repo "S3 URL (s3:https://endpoint/bucket)" ;;
+      4) kind=rclone; ask repo "rclone-путь (remote:path)" ;;
+      *) die "непонятный выбор" ;;
+    esac
+    [[ $kind == sftp   ]] && repo="sftp:$repo"
+    [[ $kind == rclone ]] && repo="rclone:$repo"
+  fi
+
+  # S3 требует ключей доступа — сохраняем отдельно от .env, с правами 600
+  if [[ $repo == s3:* ]] && has_tty; then
+    local akey skey
+    ask akey "S3 Access Key ID"
+    printf '  %s?%s S3 Secret Access Key: ' "$C_BLU" "$C_OFF" > /dev/tty
+    stty -echo < /dev/tty 2>/dev/null
+    IFS= read -r skey < /dev/tty || skey=''
+    stty echo < /dev/tty 2>/dev/null
+    printf '\n' > /dev/tty
+    umask 077
+    cat > "$MAILSTACK_DIR/.restic-env" <<CONF
+AWS_ACCESS_KEY_ID=$akey
+AWS_SECRET_ACCESS_KEY=$skey
+CONF
+    chmod 600 "$MAILSTACK_DIR/.restic-env"
+    ok "ключи S3 сохранены" ".restic-env (права 600)"
+  fi
+
+  # Пароль репозитория. Генерируем сам: без него бэкап не расшифровать
+  # ничем и никогда — restic шифрует на стороне клиента.
+  local pwf="$MAILSTACK_DIR/.restic-password"
+  if [[ ! -f $pwf ]]; then
+    umask 077
+    head -c 32 /dev/urandom | base64 | tr -d '\n=/+' > "$pwf"
+    chmod 600 "$pwf"
+    ok "пароль репозитория" "сгенерирован"
+  else
+    info "пароль репозитория" "уже существует"
+  fi
+
+  # Записываем в .env
+  local envf="$MAILSTACK_DIR/.env"
+  sed -i '/^RESTIC_REPOSITORY=/d' "$envf" 2>/dev/null
+  echo "RESTIC_REPOSITORY=$repo" >> "$envf"
+  ok "хранилище" "$repo"
+
+  export RESTIC_REPOSITORY=$repo
+  restic_env >/dev/null 2>&1
+
+  head1 "Инициализация репозитория"
+  if restic snapshots >/dev/null 2>&1; then
+    ok "репозиторий" "уже существует и открывается"
+  elif restic init >/dev/null 2>&1; then
+    ok "репозиторий" "создан"
+  else
+    fail "репозиторий" "не удалось создать"
+    hint "Проверь доступность хранилища и права."
+    hint "Для S3 — что бакет существует и ключи верны."
+    summary "" "Хранилище не готово"
+    return 1
+  fi
+
+  head1 "ВАЖНО — сохрани пароль отдельно"
+  printf '  %s%s%s\n\n' "$C_BLD" "$(cat "$pwf")" "$C_OFF"
+  printf '  restic шифрует данные на стороне клиента. Без этого пароля бэкап\n'
+  printf '  не расшифровать ничем — ни нам, ни владельцу хранилища.\n'
+  printf '  Файл лежит в %s, но если погибнет сервер, погибнет и он.\n\n' "$pwf"
+
+  summary "Резервное копирование настроено" "Настройка не завершена"
+}
+
+cmd_backup() {
+  local sub=${1:-run}
+  case "$sub" in
+    setup|init) shift; printf '%smailstack backup setup%s\n' "$C_BLD" "$C_OFF"
+                need_root; load_env; cmd_backup_setup "$@" ;;
+    list|snapshots) shift; backup_simple_cmd snapshots ;;
+    check)      shift; backup_simple_cmd check ;;
+    run|"")     shift 2>/dev/null
+                if backup_run "$@"; then summary "Бэкап снят" ""; else summary "" "Бэкап не снят"; fi ;;
+    *) die "неизвестная подкоманда backup: $sub" ;;
+  esac
+}
+
+backup_simple_cmd() {
+  need_root; load_env
+  ensure_restic
+  restic_env || die "бэкап не настроен — выполни: mailstack.sh backup setup"
+  restic "$@"
+}
+
+backup_run() {
+  local no_stop=0
+  while (( $# )); do
+    case "$1" in
+      --no-stop) no_stop=1; shift ;;
+      *) die "неизвестный флаг backup: $1" ;;
+    esac
+  done
+
+  printf '%smailstack backup%s v%s — %s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION" "$(date '+%Y-%m-%d %H:%M')"
+  need_root; load_env
+  ensure_restic
+  restic_env || die "бэкап не настроен — выполни: mailstack.sh backup setup"
+
+  head1 "Подготовка"
+  info "репозиторий" "$RESTIC_REPOSITORY"
+  local paths; paths=$(restic_paths)
+  [[ -n $paths ]] || die "нечего бэкапить — стек не развёрнут"
+  local n; n=$(wc -l <<<"$paths" | tr -d ' ')
+  ok "путей к архивации" "$n"
+
+  # Poste.io держит настройки в SQLite. Копия «на живую» может застать базу
+  # в середине транзакции, и снапшот окажется битым — обнаружится это уже
+  # при восстановлении. Пауза в полминуты дешевле такого сюрприза.
+  local stopped=0
+  if (( ! no_stop )) && docker ps -q -f name=^poste$ 2>/dev/null | grep -q .; then
+    docker stop poste >/dev/null 2>&1 && { stopped=1; ok "poste остановлен" "на время снимка"; }
+  fi
+
+  head1 "Архивация"
+  local rc=0
+  # shellcheck disable=SC2086
+  if restic backup --tag mailstack --host "${MAIL_HOSTNAME:-$(hostname)}" $paths 2>&1 \
+       | tail -6 | sed 's/^/  /'; then
+    ok "снимок создан" ""
+  else
+    rc=1; fail "архивация" "завершилась с ошибкой"
+  fi
+
+  if (( stopped )); then
+    docker start poste >/dev/null 2>&1 && ok "poste запущен" "работа возобновлена" \
+      || fail "poste" "НЕ ЗАПУСТИЛСЯ — почта не работает, подними вручную"
+  fi
+
+  head1 "Политика хранения"
+  if restic forget --tag mailstack \
+       --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune >/dev/null 2>&1; then
+    ok "старые снимки" "7 дневных, 4 недельных, 6 месячных"
+  else
+    warn "очистка" "не выполнена"
+  fi
+
+  restic snapshots --tag mailstack --latest 3 --compact 2>/dev/null | tail -6 | sed 's/^/  /'
+  return $rc
+}
+
+# Очистка целевых путей перед восстановлением.
+#
+# restic restore восстанавливает файлы из снимка, но не удаляет те, которых
+# в снимке нет: это слияние, а не замена состояния. Флаг --delete появился
+# только в restic 0.17, а в 24.04 приезжает 0.16 — поэтому чистим сами.
+#
+# Удаляем строго содержимое известных путей и только после проверки шаблона:
+# ошибка здесь стирает не тот каталог.
+restore_clean_targets() {
+  local p removed=0
+  while read -r p; do
+    [[ -z $p ]] && continue
+    case "$p" in
+      /var/lib/docker/volumes/mailstack_*/_data|"$MAILSTACK_DIR")
+        if [[ -d $p ]]; then
+          find "$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+          ok "очищено" "$p"
+          removed=$((removed+1))
+        fi ;;
+      *)
+        warn "пропущено" "$p — путь не соответствует ожидаемому шаблону" ;;
+    esac
+  done <<<"$(restic_paths)"
+  info "очищено путей" "$removed"
+}
+
+cmd_restore() {
+  local snap=latest clean=0
+  while (( $# )); do
+    case "$1" in
+      --snapshot) snap=${2:-latest}; shift 2 ;;
+      --clean)    clean=1; shift ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      *) die "неизвестный флаг restore: $1" ;;
+    esac
+  done
+
+  printf '%smailstack restore%s v%s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION"
+  need_root; load_env
+  ensure_restic
+  restic_env || die "бэкап не настроен — нужен RESTIC_REPOSITORY и .restic-password"
+
+  head1 "Снимок"
+  info "репозиторий" "$RESTIC_REPOSITORY"
+  restic snapshots --tag mailstack --latest 5 2>/dev/null | tail -7 | sed 's/^/  /'
+
+  if (( clean )); then
+    printf '\n  %s--clean: содержимое томов будет удалено перед восстановлением.%s\n' "$C_YEL" "$C_OFF"
+    printf '  Состояние станет ровно таким, как в снимке.\n\n'
+  else
+    printf '\n  %sВосстановление перезапишет файлы из снимка, но НЕ удалит те,%s\n' "$C_YEL" "$C_OFF"
+    printf '  %sкоторых в снимке нет — restic делает слияние, а не замену.%s\n' "$C_YEL" "$C_OFF"
+    printf '  Для точного отката к состоянию снимка добавь --clean.\n\n'
+  fi
+  confirm "Восстановить из снимка $snap?" || die "отменено"
+
+  head1 "Остановка стека"
+  local svc
+  for svc in poste npm portainer uptime-kuma autoconfig; do
+    docker stop "$svc" >/dev/null 2>&1 && ok "остановлен" "$svc"
+  done
+
+  if (( clean )); then
+    head1 "Очистка перед восстановлением"
+    # Пароль репозитория лежит внутри очищаемого каталога. Без него после
+    # очистки нечем расшифровать снимок — сохраняем и возвращаем обратно.
+    local keep; keep=$(mktemp -d)
+    cp -a "$MAILSTACK_DIR/.restic-password" "$keep/" 2>/dev/null
+    cp -a "$MAILSTACK_DIR/.restic-env" "$keep/" 2>/dev/null
+    cp -a "$MAILSTACK_DIR/.env" "$keep/" 2>/dev/null
+    restore_clean_targets
+    mkdir -p "$MAILSTACK_DIR"
+    cp -a "$keep/.restic-password" "$MAILSTACK_DIR/" 2>/dev/null
+    cp -a "$keep/.restic-env" "$MAILSTACK_DIR/" 2>/dev/null
+    cp -a "$keep/.env" "$MAILSTACK_DIR/" 2>/dev/null
+    rm -rf "$keep"
+    ok "ключи репозитория" "сохранены на время очистки"
+  fi
+
+  head1 "Восстановление"
+  # Пути в снимке абсолютные, поэтому цель — корень: тома лягут обратно в
+  # /var/lib/docker/volumes, конфигурация — в каталог установки
+  if restic restore "$snap" --target / 2>&1 | tail -4 | sed 's/^/  /'; then
+    ok "данные восстановлены" ""
+  else
+    fail "восстановление" "не удалось"
+    summary "" "Восстановление не выполнено"
+    return 1
+  fi
+
+  head1 "Запуск стека"
+  if [[ -d "$MAILSTACK_DIR/compose" ]]; then
+    local f
+    for f in "$MAILSTACK_DIR"/compose/*.yml; do
+      [[ -f $f ]] || continue
+      docker compose --env-file "$MAILSTACK_DIR/.env" -f "$f" up -d >/dev/null 2>&1 \
+        && ok "$(basename "$f")" "поднят" || warn "$(basename "$f")" "не поднялся"
+    done
+  else
+    warn "compose-файлы" "не найдены — запусти deploy"
+  fi
+
+  head1 "Дальше"
+  info "проверить" "mailstack.sh doctor"
+  info "сертификаты" "mailstack.sh certs-sync"
+  summary "Восстановление завершено" "Восстановление с ошибками"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_update() {
+  local skip_backup=0 with_system=0
+  while (( $# )); do
+    case "$1" in
+      --no-backup)  skip_backup=1; shift ;;
+      --system)     with_system=1; shift ;;
+      -y|--yes)     ASSUME_YES=1; shift ;;
+      *) die "неизвестный флаг update: $1" ;;
+    esac
+  done
+
+  printf '%smailstack update%s v%s — %s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION" "$(date '+%Y-%m-%d %H:%M')"
+  need_root; load_env
+  have docker || die "Docker не установлен"
+  [[ -d "$MAILSTACK_DIR/compose" ]] || die "стек не развёрнут"
+
+  # Обновление образа Poste.io необратимо: откатиться к прежней версии
+  # можно только из бэкапа, потому что миграции данных выполняются при
+  # первом запуске новой версии.
+  if (( ! skip_backup )); then
+    head1 "Бэкап перед обновлением"
+    if backup_configured; then
+      backup_run || die "бэкап не снят — обновление прервано"
+    else
+      warn "бэкап" "не настроен"
+      hint "Обновление образа Poste.io необратимо: миграции данных выполняются"
+      hint "при первом запуске новой версии, и откат возможен только из бэкапа."
+      confirm "Обновлять без бэкапа?" || die "отменено. Настрой: mailstack.sh backup setup"
+    fi
+  fi
+
+  head1 "Образы"
+  local f changed=0
+  for f in "$MAILSTACK_DIR"/compose/*.yml; do
+    [[ -f $f ]] || continue
+    local before after name; name=$(basename "$f")
+    before=$(docker compose --env-file "$MAILSTACK_DIR/.env" -f "$f" images -q 2>/dev/null | sort | md5sum)
+    if docker compose --env-file "$MAILSTACK_DIR/.env" -f "$f" pull >/dev/null 2>&1; then
+      after=$(docker compose --env-file "$MAILSTACK_DIR/.env" -f "$f" images -q 2>/dev/null | sort | md5sum)
+      if [[ $before != "$after" ]]; then
+        ok "$name" "есть новая версия"
+        changed=1
+      else
+        info "$name" "уже актуально"
+      fi
+    else
+      warn "$name" "не удалось загрузить образы"
+    fi
+  done
+
+  head1 "Перезапуск"
+  for f in "$MAILSTACK_DIR"/compose/*.yml; do
+    [[ -f $f ]] || continue
+    docker compose --env-file "$MAILSTACK_DIR/.env" -f "$f" up -d >/dev/null 2>&1 \
+      && ok "$(basename "$f")" "актуален" || fail "$(basename "$f")" "не поднялся"
+  done
+
+  if (( with_system )); then
+    head1 "Система"
+    export DEBIAN_FRONTEND=noninteractive
+    run_step "apt update" apt-get update -qq
+    run_step "apt upgrade" apt-get -y -qq upgrade
+    if [[ -f /var/run/reboot-required ]]; then
+      warn "перезагрузка" "требуется для применения обновлений ядра"
+    fi
+  fi
+
+  head1 "Очистка"
+  local freed; freed=$(docker image prune -af 2>/dev/null | tail -1)
+  ok "неиспользуемые образы" "${freed:-удалены}"
+
+  head1 "Проверка"
+  check_stack
+  (( changed )) && info "сертификаты" "после обновления Poste.io выполни certs-sync"
+  summary "Обновление завершено" "Обновление с ошибками"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MIGRATE
+#
+# Переезд целиком через бэкап: снимаем свежий снимок на старой машине,
+# на новой разворачиваем из него. Отдельного канала передачи не нужно —
+# хранилище уже общее для обеих машин.
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_migrate() {
+  local sub=${1:-help}
+  shift 2>/dev/null || true
+
+  printf '%smailstack migrate%s v%s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION"
+
+  case "$sub" in
+    prepare)
+      need_root; load_env
+      backup_configured || die "нужен настроенный бэкап: mailstack.sh backup setup"
+
+      head1 "Финальный снимок на этой машине"
+      backup_run || die "бэкап не снят — переезжать нельзя"
+
+      local ip; ip=$(detect_public_ip)
+      head1 "Что сделать на новой машине"
+      printf '  %s1.%s Подготовить систему:\n' "$C_BLD" "$C_OFF"
+      printf '     curl -fsSL %s | bash -s -- bootstrap \\\n' \
+             "https://raw.githubusercontent.com/iMironRU/mailstack/main/mailstack.sh"
+      printf '       --domain %s --hostname %s --email %s --tz %s\n\n' \
+             "${MAIL_DOMAIN:-домен}" "${MAIL_HOSTNAME:-хост}" "${LE_EMAIL:-email}" "${TZ:-UTC}"
+      printf '  %s2.%s Подключить то же хранилище бэкапов:\n' "$C_BLD" "$C_OFF"
+      printf '     mailstack.sh backup setup --repo %s\n' "${RESTIC_REPOSITORY:-<репозиторий>}"
+      printf '     %sи положить туда тот же .restic-password — иначе снимок не расшифровать%s\n\n' "$C_YEL" "$C_OFF"
+      printf '  %s3.%s Восстановить и поднять:\n' "$C_BLD" "$C_OFF"
+      printf '     mailstack.sh restore\n\n'
+
+      head1 "Не забыть при переключении"
+      info "TTL" "снизить до 300 заранее, иначе смена A-записей будет расходиться часами"
+      info "A-записи" "перевести mail/status/portainer/autoconfig/autodiscover на новый IP"
+      info "PTR" "задать на новом IP в панели провайдера — иначе почту начнут отбивать"
+      [[ -n ${RELAY_HOST:-} && ${RELAY_HOST} == *brevo* ]] && \
+        info "Brevo" "добавить новый IP в Security → Authorized IPs ДО переключения"
+      info "старый сервер" "не гасить сразу — дать почте дойти по старым MX"
+      info "текущий IP" "${ip:-неизвестен}"
+      summary "Снимок готов, машина к переезду подготовлена" ""
+      ;;
+    finish)
+      need_root; load_env
+      head1 "Проверка после переезда"
+      local ip; ip=$(detect_public_ip)
+      check_stack
+      check_rdns "$ip"
+      [[ -n ${MAIL_DOMAIN:-} ]] && { resolve_auth_ns "$MAIL_DOMAIN"; check_domain_dns "$MAIL_DOMAIN" "$ip"; }
+      check_relay
+      summary "Переезд выглядит завершённым" "Есть проблемы — см. выше"
+      ;;
+    *)
+      printf '\n  Переезд состоит из двух шагов:\n\n'
+      printf '    %sНа старой машине:%s  mailstack.sh migrate prepare\n' "$C_BLD" "$C_OFF"
+      printf '      снимет финальный бэкап и выдаст команды для новой машины\n\n'
+      printf '    %sНа новой машине:%s   bootstrap → backup setup → restore\n' "$C_BLD" "$C_OFF"
+      printf '      затем mailstack.sh migrate finish — проверка после переключения DNS\n\n'
+      exit 0
+      ;;
+  esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DEPLOY — генерация compose-файлов и запуск стека
 #
 # Сервисы разнесены по отдельным стекам: перезапуск Poste.io не должен
@@ -2607,9 +3089,10 @@ ${C_BLD}Команды${C_OFF}
   uninstall          Удалить стек; с --purge — откатить и системные изменения
   deploy             Развернуть стек (--pull — обновить образы)
   certs-sync         Подтянуть сертификат из NPM в Poste.io для SMTP/IMAP
-  update             Обновить образы и систему                        ${C_DIM}(в работе)${C_OFF}
-  backup / restore   Резервное копирование в S3 (restic)              ${C_DIM}(в работе)${C_OFF}
-  migrate            Переезд на другую виртуалку                      ${C_DIM}(в работе)${C_OFF}
+  update             Обновить образы (--system — и пакеты ОС)
+  backup             Снять бэкап; backup setup — настроить хранилище
+  restore            Восстановить из бэкапа (--clean — точный откат к снимку)
+  migrate            Переезд: migrate prepare / migrate finish
 
 ${C_BLD}Флаги bootstrap${C_OFF}
   --domain DOMAIN    Основной домен (иначе спросит интерактивно)
@@ -2619,6 +3102,12 @@ ${C_BLD}Флаги bootstrap${C_OFF}
   --skip-domain-check  Не проверять домен перед установкой
   --no-relay         Продолжить без SMTP-релея (только приём почты)
   -y, --yes          Не задавать вопросов (для автоматизации)
+
+${C_BLD}Флаги backup / update${C_OFF}
+  backup setup --repo REPO   Подключить хранилище без вопросов
+  backup --no-stop           Не останавливать Poste.io на время снимка
+  update --system            Обновить и пакеты ОС
+  update --no-backup         Не снимать бэкап перед обновлением
 
 ${C_BLD}Флаги ssh-harden${C_OFF}
   --confirm          Подтвердить, что вход по ключу работает (отменяет автооткат)
@@ -2664,7 +3153,10 @@ main() {
     ssh-harden) cmd_ssh_harden "$@" ;;
     deploy)     cmd_deploy "$@" ;;
     certs-sync) cmd_certs_sync "$@" ;;
-    update|backup|restore|migrate) cmd_todo "$cmd" ;;
+    backup)  cmd_backup "$@" ;;
+    restore) cmd_restore "$@" ;;
+    update)  cmd_update "$@" ;;
+    migrate) cmd_migrate "$@" ;;
     help|--help|-h) usage ;;
     version|--version) echo "mailstack.sh $MAILSTACK_VERSION" ;;
     *) usage; exit 1 ;;
