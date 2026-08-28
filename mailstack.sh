@@ -2431,7 +2431,10 @@ cmd_deploy() {
   printf '     отдадут клиентам ошибку TLS:\n'
   printf '     mailstack.sh certs-sync\n\n'
   printf '  %s4.%s Создать домен и первый ящик в админке https://%s\n' "$C_BLD" "$C_OFF" "$MAIL_HOSTNAME"
-  printf '     Там же появится значение DKIM для записи s1._domainkey\n\n'
+  printf '     Там же появится значение DKIM для записи s1._domainkey\n'
+  printf '     %sИ там же задать hostname сервера — по умолчанию образ%s\n' "$C_YEL" "$C_OFF"
+  printf '     %sпредставляется как mail.example.com. Gmail и Microsoft сверяют%s\n' "$C_YEL" "$C_OFF"
+  printf '     %sHELO с PTR и снижают репутацию при несовпадении.%s\n\n' "$C_YEL" "$C_OFF"
   printf '  %s5.%s Добавить MX: %s  MX 10 %s\n\n' "$C_BLD" "$C_OFF" "$MAIL_DOMAIN" "$MAIL_HOSTNAME"
 
   summary "Стек запущен" "Запуск завершился с ошибками"

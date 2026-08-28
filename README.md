@@ -17,8 +17,8 @@
 | `preflight` | готово |
 | `domain` | готово |
 | `bootstrap` | готово |
-| `deploy` | написан, не проверен на живой машине |
-| `certs-sync` | написан, не проверен |
+| `deploy` | готово, проверен на живой машине |
+| `certs-sync` | написан, ждёт первого выпуска сертификата |
 | `ssh-key` / `ssh-harden` | готово |
 | `uninstall` | готово |
 | `doctor` | готово |
@@ -69,6 +69,20 @@ curl -fsSL https://raw.githubusercontent.com/iMironRU/mailstack/main/mailstack.s
 - A / MX / SPF / DKIM / DMARC домена.
 
 Совместим с bash 3.2, то есть работает на macOS из коробки.
+
+## Потребление памяти
+
+Замер на реальном стенде (2 vCPU / 1967 MB RAM), сразу после `deploy`:
+
+| Контейнер | Память |
+|---|---|
+| Poste.io | 378 MB |
+| Uptime Kuma | 177 MB |
+| NPM | 70 MB |
+| Portainer | 21 MB |
+| autoconfig | 3 MB |
+
+Итого с системой — 1017 MB из 1967, свободно 950 MB, swap задействован на 16 MB. Отключение ClamAV решающее: он один занимает больше, чем весь остальной стек.
 
 ## Откат
 
