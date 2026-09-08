@@ -357,6 +357,39 @@ check_ports() {
   (( busy == 0 )) && ok "порты стека" "все ${#STACK_PORTS[@]} свободны"
 }
 
+# После развёртывания смысл проверки портов обратный: занятый порт — это
+# норма, потому что его держит наш контейнер. Проверка из preflight здесь
+# давала десяток ложных ошибок и итог «найдены проблемы» на исправном стеке.
+check_ports_listening() {
+  head1 "Порты стека"
+  have ss || { warn "проверка портов" "нет ss"; return; }
+  local listening; listening=$(ss -tlnpH 2>/dev/null)
+
+  local port desc line
+  for port in 25 80 443 465 587 993 995; do
+    desc=$(port_desc "$port")
+    line=$(awk -v p=":$port\$" '$4 ~ p {print}' <<<"$listening" | head -1)
+    if [[ -n $line ]]; then
+      ok "порт $port" "$desc"
+    else
+      fail "порт $port" "никто не слушает — $desc"
+    fi
+  done
+
+  # Админки должны слушать только на петле: docker обходит правила ufw,
+  # поэтому единственная защита — привязка к 127.0.0.1
+  for port in 81 3001 9000; do
+    line=$(awk -v p=":$port\$" '$4 ~ p {print $4}' <<<"$listening" | head -1)
+    if [[ -z $line ]]; then
+      info "порт $port" "не слушается"
+    elif [[ $line == 127.0.0.1:* || $line == "[::1]:"* ]]; then
+      ok "порт $port" "только на 127.0.0.1, как и задумано"
+    else
+      fail "порт $port" "слушает на $line — админка открыта наружу"
+    fi
+  done
+}
+
 check_network() {
   head1 "Сеть и доступность репозиториев"
 
@@ -2987,7 +3020,7 @@ cmd_doctor() {
     load_env
     local ip; ip=$(detect_public_ip)
     check_resources
-    check_ports
+    check_ports_listening
     check_stack
     check_relay
     check_rdns "$ip"
