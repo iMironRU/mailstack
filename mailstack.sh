@@ -2391,6 +2391,292 @@ YML
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NPM-SETUP — proxy hosts и сертификаты через API
+#
+# Настройка пяти хостов руками занимает минут десять и повторяется после
+# каждого uninstall. API избавляет от этого полностью.
+#
+# Сертификат заказывается отдельным вызовом ДО создания хоста: так ошибка
+# выпуска (лимит Let's Encrypt, недоступный порт 80, неверная A-запись)
+# отличима от ошибки конфигурации самого хоста.
+# ─────────────────────────────────────────────────────────────────────────────
+
+NPM_API='http://127.0.0.1:81/api'
+NPM_TOKEN=''
+
+# Список проксируемых сервисов: поддомен|контейнер|порт
+# Массив строк, а не ассоциативный: скрипт должен разбираться и на bash 3.2
+NPM_HOSTS=(
+  "mail|poste|80"
+  "status|uptime-kuma|3001"
+  "portainer|portainer|9000"
+  "autoconfig|autoconfig|80"
+  "autodiscover|autoconfig|80"
+)
+
+npm_api() {
+  local method=$1 path=$2 data=${3:-}
+  local args=(-sS -X "$method" -H 'Content-Type: application/json')
+  [[ -n $NPM_TOKEN ]] && args+=(-H "Authorization: Bearer $NPM_TOKEN")
+  [[ -n $data ]] && args+=(-d "$data")
+  curl "${args[@]}" --max-time 120 "${NPM_API}${path}" 2>/dev/null
+}
+
+npm_login() {
+  local email=$1 pass=$2
+  local resp; resp=$(npm_api POST /tokens \
+    "$(jq -nc --arg i "$email" --arg s "$pass" '{identity:$i,secret:$s}')")
+  local tok; tok=$(jq -r '.token // empty' <<<"$resp" 2>/dev/null)
+  [[ -n $tok ]] && { NPM_TOKEN=$tok; return 0; }
+  return 1
+}
+
+npm_save_creds() {
+  local email=$1 pass=$2
+  NPM_ADMIN_EMAIL=$email
+  NPM_ADMIN_PASS=$pass
+  # Без сохранения повторный npm-setup не сможет войти: пароль
+  # сгенерирован и больше нигде не хранится
+  local envf="$MAILSTACK_DIR/.env"
+  sed -i '/^NPM_ADMIN_EMAIL=/d;/^NPM_ADMIN_PASS=/d' "$envf" 2>/dev/null
+  printf 'NPM_ADMIN_EMAIL=%s\nNPM_ADMIN_PASS=%s\n' "$email" "$pass" >> "$envf"
+  chmod 600 "$envf"
+}
+
+npm_gen_password() {
+  local p; p=$(openssl rand -base64 18 2>/dev/null | tr -d '/+=' | cut -c1-20)
+  [[ ${#p} -ge 12 ]] && { echo "$p"; return; }
+  echo "ms$(date +%s)$RANDOM"
+}
+
+# Учётная запись администратора NPM.
+#
+# В NPM 2.15 первого пользователя автоматически больше нет: /api/ отдаёт
+# setup:false, и пока он false, POST /api/users создаёт админа БЕЗ
+# авторизации. В версиях до этого пользователь заводился сам с
+# admin@example.com / changeme. Поддерживаем оба пути.
+npm_ensure_admin() {
+  head1 "Учётная запись NPM"
+
+  local setup_done
+  setup_done=$(curl -sS --max-time 10 "$NPM_API/" 2>/dev/null | jq -r '.setup // false' 2>/dev/null)
+  info "состояние NPM" "setup=${setup_done:-неизвестно}"
+
+  if [[ $setup_done == false ]]; then
+    # Логин администратора NPM и адрес для Let's Encrypt — разные вещи,
+    # хотя обычно совпадают. Задаётся флагом --admin-email, иначе берётся
+    # LE_EMAIL, и лишь в последнюю очередь admin@<домен>.
+    local email=${NPM_ADMIN_EMAIL:-${LE_EMAIL:-admin@$MAIL_DOMAIN}}
+    local pass; pass=$(npm_gen_password)
+    local resp; resp=$(npm_api POST /users "$(jq -nc --arg e "$email" --arg s "$pass" \
+      '{name:"Administrator",nickname:"Admin",email:$e,roles:["admin"],is_disabled:false,
+        auth:{type:"password",secret:$s}}')")
+
+    if ! jq -e '.id' <<<"$resp" >/dev/null 2>&1; then
+      fail "создание админа" "$(jq -r '.error.message // "нет ответа"' <<<"$resp" 2>/dev/null | cut -c1-90)"
+      return 1
+    fi
+    ok "администратор создан" "$email"
+    npm_save_creds "$email" "$pass"
+    npm_login "$email" "$pass" || { fail "вход" "созданной учёткой войти не удалось"; return 1; }
+    ok "вход" "$email"
+    return 0
+  fi
+
+  # setup=true — учётка уже есть
+  if [[ -n ${NPM_ADMIN_EMAIL:-} && -n ${NPM_ADMIN_PASS:-} ]] \
+     && npm_login "$NPM_ADMIN_EMAIL" "$NPM_ADMIN_PASS"; then
+    ok "вход" "$NPM_ADMIN_EMAIL (из .env)"
+    return 0
+  fi
+
+  # Старые версии NPM заводили пользователя сами — меняем дефолтные креды
+  if npm_login "admin@example.com" "changeme"; then
+    ok "вход" "дефолтные креды приняты — меняю их"
+    local new_email=${LE_EMAIL:-admin@$MAIL_DOMAIN}
+    local new_pass; new_pass=$(npm_gen_password)
+    npm_api PUT /users/1 "$(jq -nc --arg e "$new_email" \
+      '{name:"Administrator",nickname:"Admin",email:$e,roles:["admin"],is_disabled:false}')" >/dev/null
+    local r; r=$(npm_api PUT /users/1/auth \
+      "$(jq -nc --arg c changeme --arg s "$new_pass" '{type:"password",current:$c,secret:$s}')")
+    if jq -e '.error' <<<"$r" >/dev/null 2>&1; then
+      fail "смена пароля" "$(jq -r '.error.message' <<<"$r")"
+      return 1
+    fi
+    npm_save_creds "$new_email" "$new_pass"
+    npm_login "$new_email" "$new_pass" || { fail "повторный вход" "не удался"; return 1; }
+    ok "учётка изменена" "$new_email, пароль в .env"
+    return 0
+  fi
+
+  fail "вход в NPM" "учётка уже создана, но пароль неизвестен"
+  hint "Впиши NPM_ADMIN_EMAIL и NPM_ADMIN_PASS в $MAILSTACK_DIR/.env,"
+  hint "либо пересоздай NPM начисто: docker volume rm mailstack_npm_data"
+  return 1
+}
+
+# Ищем уже выпущенный сертификат: при пересборках стенда это единственный
+# способ не упереться в лимит Let's Encrypt (5 неудачных проверок в час
+# и 50 сертификатов в неделю на зарегистрированный домен).
+npm_find_cert() {
+  local fqdn=$1
+  npm_api GET /nginx/certificates | jq -r --arg d "$fqdn" \
+    '[.[] | select(.domain_names | index($d)) | .id] | first // empty' 2>/dev/null
+}
+
+# В NPM 2.15 схема meta допускает только dns_challenge, key_type,
+# propagation_seconds и поля DNS-провайдера. Полей letsencrypt_email и
+# letsencrypt_agree в ней нет — с ними запрос отвергается валидатором
+# ещё до обращения к Let's Encrypt.
+npm_request_cert() {
+  local fqdn=$1
+  local payload; payload=$(jq -nc --arg d "$fqdn" \
+    '{provider:"letsencrypt",nice_name:$d,domain_names:[$d],meta:{dns_challenge:false}}')
+  npm_api POST /nginx/certificates "$payload"
+}
+
+# Привязать сертификат к уже существующему хосту: при повторном запуске
+# хост может быть создан ранее без HTTPS, и тогда его нужно обновить,
+# а не пересоздавать
+npm_attach_cert() {
+  local host_id=$1 cert_id=$2
+  npm_api PUT "/nginx/proxy-hosts/$host_id" \
+    "$(jq -nc --argjson c "$cert_id" '{certificate_id:$c,ssl_forced:true,http2_support:true}')"
+}
+
+npm_host_exists() {
+  local fqdn=$1
+  npm_api GET /nginx/proxy-hosts | jq -r --arg d "$fqdn" \
+    '[.[] | select(.domain_names | index($d)) | .id] | first // empty' 2>/dev/null
+}
+
+npm_create_host() {
+  local fqdn=$1 upstream=$2 port=$3 cert_id=$4
+  local payload; payload=$(jq -nc \
+    --arg d "$fqdn" --arg h "$upstream" --argjson p "$port" --argjson c "$cert_id" \
+    '{domain_names:[$d],forward_scheme:"http",forward_host:$h,forward_port:$p,
+      certificate_id:$c,ssl_forced:true,http2_support:true,hsts_enabled:false,
+      hsts_subdomains:false,block_exploits:true,caching_enabled:false,
+      allow_websocket_upgrade:true,access_list_id:0,advanced_config:"",locations:[]}')
+  npm_api POST /nginx/proxy-hosts "$payload"
+}
+
+cmd_npm_setup() {
+  local skip_certs=0
+  while (( $# )); do
+    case "$1" in
+      --no-certs)    skip_certs=1; shift ;;
+      --admin-email) NPM_ADMIN_EMAIL=${2:-}; shift 2 ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      *) die "неизвестный флаг npm-setup: $1" ;;
+    esac
+  done
+
+  printf '%smailstack npm-setup%s v%s\n' "$C_BLD" "$C_OFF" "$MAILSTACK_VERSION"
+  need_root
+  load_env
+  [[ -n ${MAIL_DOMAIN:-} ]] || die "не задан MAIL_DOMAIN — сначала bootstrap"
+  have jq || die "нужен jq: apt-get install -y jq"
+
+  head1 "Доступность NPM"
+  if ! tcp_probe 127.0.0.1 81 5; then
+    fail "админка NPM" "127.0.0.1:81 не отвечает"
+    hint "Стек запущен? Проверь: mailstack.sh deploy"
+    die "NPM недоступен"
+  fi
+  ok "админка NPM" "отвечает на 127.0.0.1:81"
+
+  npm_ensure_admin || die "не удалось войти в NPM"
+
+  head1 "Proxy hosts"
+  local entry sub upstream port fqdn cert_id resp existing
+  local created=0 reused=0
+
+  for entry in "${NPM_HOSTS[@]}"; do
+    IFS='|' read -r sub upstream port <<<"$entry"
+    fqdn="$sub.$MAIL_DOMAIN"
+
+    existing=$(npm_host_exists "$fqdn")
+    if [[ -n $existing ]]; then
+      local has_cert
+      has_cert=$(npm_api GET "/nginx/proxy-hosts/$existing" | jq -r '.certificate_id // 0')
+      if [[ ${has_cert:-0} != 0 ]] || (( skip_certs )); then
+        ok "$fqdn" "уже настроен (id $existing)"
+        reused=$((reused+1))
+        continue
+      fi
+      # Хост есть, но без HTTPS — выпускаем сертификат и привязываем
+      cert_id=$(npm_find_cert "$fqdn")
+      if [[ -z $cert_id ]]; then
+        resp=$(npm_request_cert "$fqdn")
+        cert_id=$(jq -r '.id // empty' <<<"$resp" 2>/dev/null)
+      fi
+      if [[ -n $cert_id ]]; then
+        npm_attach_cert "$existing" "$cert_id" >/dev/null
+        ok "$fqdn" "сертификат привязан к существующему хосту (cert $cert_id)"
+        reused=$((reused+1))
+      else
+        fail "$fqdn" "$(jq -r '.error.message // "сертификат не выпущен"' <<<"${resp:-{}}" 2>/dev/null | cut -c1-80)"
+      fi
+      continue
+    fi
+
+    # A-запись обязана указывать на этот сервер, иначе Let's Encrypt не
+    # пройдёт проверку и потратит попытку из часового лимита
+    local a; a=$(dns_query "$fqdn" A | head -1)
+    if [[ -z $a ]]; then
+      fail "$fqdn" "A-запись не задана — пропускаю"
+      continue
+    fi
+
+    cert_id=0
+    if (( ! skip_certs )); then
+      cert_id=$(npm_find_cert "$fqdn")
+      if [[ -n $cert_id ]]; then
+        ok "$fqdn" "переиспользую сертификат id $cert_id"
+      else
+        resp=$(npm_request_cert "$fqdn")
+        cert_id=$(jq -r '.id // empty' <<<"$resp" 2>/dev/null)
+        if [[ -z $cert_id ]]; then
+          local msg; msg=$(jq -r '.error.message // "нет ответа"' <<<"$resp" 2>/dev/null)
+          fail "$fqdn" "сертификат не выпущен: ${msg:0:90}"
+          case "$msg" in
+            *[Rr]ate*|*too\ many*)
+              hint "Лимит Let's Encrypt: 5 неудачных проверок в час на домен." 
+              hint "Подожди час либо запусти с --no-certs и выпусти позже." ;;
+            *additional\ properties*|*must\ NOT*)
+              hint "Запрос отвергнут валидатором API, до Let's Encrypt он не дошёл." 
+              hint "Схема payload разошлась с версией NPM — это дефект скрипта." ;;
+            *)
+              hint "Проверь, что порт 80 доступен снаружи и A-запись верна." ;;
+          esac
+          cert_id=0
+        else
+          ok "$fqdn" "сертификат выпущен (id $cert_id)"
+        fi
+      fi
+    fi
+
+    resp=$(npm_create_host "$fqdn" "$upstream" "$port" "${cert_id:-0}")
+    if jq -e '.id' <<<"$resp" >/dev/null 2>&1; then
+      ok "$fqdn" "→ $upstream:$port$([[ ${cert_id:-0} != 0 ]] && echo ', HTTPS' || echo ', без HTTPS')"
+      created=$((created+1))
+    else
+      fail "$fqdn" "$(jq -r '.error.message // "не создан"' <<<"$resp" 2>/dev/null | cut -c1-90)"
+    fi
+  done
+
+  info "итого" "создано $created, переиспользовано $reused"
+
+  head1 "Дальше"
+  info "сертификат для SMTP/IMAP" "mailstack.sh certs-sync"
+  info "админка Poste.io" "https://${MAIL_HOSTNAME:-mail.$MAIL_DOMAIN}"
+  info "админка NPM" "ssh -L 8181:127.0.0.1:81 root@<адрес>, вход ${NPM_ADMIN_EMAIL:-?}"
+
+  summary "NPM настроен" "Настройка завершилась с ошибками"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Сертификаты для SMTP/IMAP
 #
 # NPM терминирует TLS только для HTTP. Порты 465/993 и STARTTLS на 587
@@ -2405,68 +2691,118 @@ cmd_certs_sync() {
   load_env
   local host=${MAIL_HOSTNAME:-mail.${MAIL_DOMAIN:-}}
   [[ -n ${MAIL_DOMAIN:-} ]] || die "не задан MAIL_DOMAIN — запусти bootstrap"
-
-  head1 "Поиск сертификата для $host"
   have docker || die "Docker не установлен"
 
-  # NPM хранит сертификаты как npm-<N>; какой из них наш — определяем по
-  # содержимому, а не по номеру: номера меняются при перевыпуске
-  local cert_dir=''
-  local dirs; dirs=$(docker run --rm -v mailstack_npm_letsencrypt:/le alpine:latest \
-                     sh -c 'ls -1 /le/live 2>/dev/null' 2>/dev/null)
-  local d
-  for d in $dirs; do
-    [[ $d == README ]] && continue
-    local cn
-    cn=$(docker run --rm -v mailstack_npm_letsencrypt:/le alpine:latest \
-         sh -c "openssl x509 -in /le/live/$d/fullchain.pem -noout -text 2>/dev/null | grep -o 'DNS:[^,]*'" 2>/dev/null)
-    if grep -q "DNS:$host" <<<"$cn"; then
-      cert_dir=$d
-      ok "сертификат найден" "$d"
-      break
-    fi
-  done
+  head1 "Поиск сертификата для $host"
 
-  if [[ -z $cert_dir ]]; then
-    fail "сертификат" "для $host не найден в NPM"
-    hint "Сначала создай в NPM proxy host для $host и выпусти сертификат."
-    hint "Порты 465/993 без него работать не будут — клиенты получат ошибку TLS."
+  # Каталог npm-<N> в томе NPM соответствует certificate_id из API.
+  # Спросить API надёжнее, чем разбирать сертификаты: в alpine нет openssl,
+  # и попытка определить владельца по SAN молча не находила ничего.
+  local cert_id=''
+  if have jq && tcp_probe 127.0.0.1 81 5; then
+    if npm_login "${NPM_ADMIN_EMAIL:-}" "${NPM_ADMIN_PASS:-}" 2>/dev/null; then
+      cert_id=$(npm_find_cert "$host")
+      [[ -n $cert_id ]] && ok "сертификат" "npm-$cert_id (по данным API)"
+    else
+      warn "API NPM" "войти не удалось — ищу перебором"
+    fi
+  fi
+
+  # Запасной путь: openssl внутри контейнера npm, он там есть
+  if [[ -z $cert_id ]] && docker ps -q -f name=^npm$ | grep -q .; then
+    local d
+    for d in $(docker exec npm sh -c 'ls -1 /etc/letsencrypt/live 2>/dev/null' 2>/dev/null); do
+      [[ $d == README ]] && continue
+      if docker exec npm sh -c "openssl x509 -in /etc/letsencrypt/live/$d/fullchain.pem -noout -text 2>/dev/null" 2>/dev/null \
+         | grep -q "DNS:$host"; then
+        cert_id=${d#npm-}
+        ok "сертификат" "$d (найден перебором)"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z $cert_id ]]; then
+    fail "сертификат" "для $host не найден"
+    hint "Выпусти его: mailstack.sh npm-setup"
+    hint "Без него порты 465 и 993 отдадут клиентам ошибку TLS."
     summary "" "Сертификат не готов"
     return 1
   fi
 
   head1 "Копирование в Poste.io"
-  docker ps -q -f name=^poste$ | grep -q . || { fail "poste" "контейнер не запущен"; return 1; }
+  docker ps -q -f name=^poste$ | grep -q . || { fail "poste" "контейнер не запущен"; summary "" "Poste.io не работает"; return 1; }
 
+  # Раскладка по README самого образа: server.crt — ровно один сертификат,
+  # промежуточные отдельно в ca.crt. Положить сюда fullchain.pem нельзя:
+  # в нём цепочка, и службы такой файл не принимают.
   local tmp; tmp=$(mktemp -d)
   docker run --rm -v mailstack_npm_letsencrypt:/le -v "$tmp:/out" alpine:latest \
-    sh -c "cp /le/live/$cert_dir/fullchain.pem /out/server.crt && cp /le/live/$cert_dir/privkey.pem /out/server.key" \
-    >/dev/null 2>&1 || { fail "чтение сертификата" "не удалось"; rm -rf "$tmp"; return 1; }
+    sh -c "cp /le/live/npm-$cert_id/cert.pem /out/server.crt \
+        && cp /le/live/npm-$cert_id/chain.pem /out/ca.crt \
+        && cp /le/live/npm-$cert_id/privkey.pem /out/server.key" \
+    >/dev/null 2>&1 || { fail "чтение сертификата" "npm-$cert_id недоступен"; rm -rf "$tmp"; return 1; }
 
-  # Сравниваем с уже установленным: перезапускать почтовые службы на каждый
-  # прогон незачем, это разрывает активные сессии клиентов
+  local cn; cn=$(openssl x509 -in "$tmp/server.crt" -noout -subject 2>/dev/null | sed 's/.*CN *= *//')
+  ok "прочитан" "CN=$cn"
+
+  # Перезапускать почтовые службы на каждый прогон незачем — это разрывает
+  # активные сессии клиентов. Сравниваем отпечатки.
   local new_fp old_fp
   new_fp=$(openssl x509 -in "$tmp/server.crt" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
   old_fp=$(docker exec poste sh -c 'openssl x509 -in /data/ssl/server.crt -noout -fingerprint -sha256 2>/dev/null' 2>/dev/null | cut -d= -f2)
 
-  if [[ -n $old_fp && $new_fp == "$old_fp" ]]; then
-    ok "сертификат" "уже актуален, перезапуск не нужен"
+  # Одного отпечатка мало: он считается по первому сертификату в файле,
+  # поэтому fullchain.pem и cert.pem дают одинаковый результат. Раскладка
+  # при этом разная, и без проверки состава файлов обновление молча
+  # пропускалось — ca.crt так и не появлялся.
+  local ca_ok=1 single_cert=1
+  docker exec poste test -s /data/ssl/ca.crt 2>/dev/null || ca_ok=0
+  local n_certs
+  n_certs=$(docker exec poste sh -c 'grep -c "BEGIN CERTIFICATE" /data/ssl/server.crt 2>/dev/null' 2>/dev/null | tr -dc '0-9')
+  [[ ${n_certs:-0} -eq 1 ]] || single_cert=0
+
+  if [[ -n $old_fp && $new_fp == "$old_fp" ]] && (( ca_ok && single_cert )); then
+    ok "сертификат" "уже актуален, перезапуск не требуется"
     rm -rf "$tmp"
     summary "Сертификаты в порядке" ""
     return 0
   fi
+  (( ca_ok ))      || info "ca.crt" "отсутствует — раскладку нужно обновить"
+  (( single_cert )) || info "server.crt" "содержит цепочку вместо одного сертификата"
 
   docker exec poste mkdir -p /data/ssl >/dev/null 2>&1
   docker cp "$tmp/server.crt" poste:/data/ssl/server.crt >/dev/null 2>&1 \
+    && docker cp "$tmp/ca.crt"    poste:/data/ssl/ca.crt     >/dev/null 2>&1 \
     && docker cp "$tmp/server.key" poste:/data/ssl/server.key >/dev/null 2>&1 \
-    && ok "сертификат скопирован" "/data/ssl" \
+    && ok "скопирован" "/data/ssl/{server.crt,ca.crt,server.key}" \
     || { fail "копирование" "не удалось"; rm -rf "$tmp"; return 1; }
   docker exec poste chmod 600 /data/ssl/server.key >/dev/null 2>&1
   rm -rf "$tmp"
 
-  # Перечитывают конфигурацию без разрыва установленных соединений
-  docker exec poste sh -c 'supervisorctl restart dovecot postfix 2>/dev/null || true' >/dev/null 2>&1
-  ok "dovecot и postfix" "перезапущены с новым сертификатом"
+  # Нужен полный перезапуск контейнера, а не отдельных служб. Файлы из
+  # /data/ssl не читаются напрямую: init образа копирует их по местам при
+  # старте (об этом и говорит README в этом каталоге). Перезапуск haraka,
+  # dovecot и nginx через s6 сертификат не подхватывал — порты продолжали
+  # отдавать самоподписанный. Заодно supervisorctl в образе нет вовсе:
+  # процессами управляет s6.
+  if docker restart poste >/dev/null 2>&1; then
+    ok "poste" "перезапущен для применения сертификата"
+  else
+    fail "перезапуск" "не удался"
+    hint "Примени вручную: docker restart poste"
+    summary "" "Сертификат скопирован, но не применён"
+    return 1
+  fi
+
+  local i
+  for (( i = 1; i <= 45; i++ )); do
+    if tcp_probe 127.0.0.1 993 2; then
+      ok "IMAPS" "отвечает после перезапуска"
+      break
+    fi
+    sleep 2
+  done
 
   summary "Сертификаты синхронизированы" "Синхронизация не удалась"
 }
@@ -3145,6 +3481,7 @@ ${C_BLD}Команды${C_OFF}
   ssh-harden         Отключить вход по паролю (только после проверки ключа)
   uninstall          Удалить стек; с --purge — откатить и системные изменения
   deploy             Развернуть стек (--pull — обновить образы)
+  npm-setup          Создать proxy hosts и выпустить сертификаты через API NPM
   certs-sync         Подтянуть сертификат из NPM в Poste.io для SMTP/IMAP
   update             Обновить образы (--system — и пакеты ОС)
   backup             Снять бэкап; backup setup — настроить хранилище
@@ -3170,6 +3507,10 @@ ${C_BLD}Флаги ssh-harden${C_OFF}
   --confirm          Подтвердить, что вход по ключу работает (отменяет автооткат)
   --rollback         Немедленно вернуть парольный вход
   --timeout MIN      Через сколько минут сработает автооткат (по умолчанию 10)
+
+${C_BLD}Флаги npm-setup${C_OFF}
+  --admin-email ADDR Логин администратора NPM (по умолчанию — email для LE)
+  --no-certs         Создать хосты без выпуска сертификатов
 
 ${C_BLD}Флаги uninstall${C_OFF}
   --purge            Откатить и системные изменения: Docker, swap, ufw,
@@ -3210,6 +3551,7 @@ main() {
     ssh-harden) cmd_ssh_harden "$@" ;;
     deploy)     cmd_deploy "$@" ;;
     certs-sync) cmd_certs_sync "$@" ;;
+    npm-setup)  cmd_npm_setup "$@" ;;
     backup)  cmd_backup "$@" ;;
     restore) cmd_restore "$@" ;;
     update)  cmd_update "$@" ;;
