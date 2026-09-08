@@ -2768,8 +2768,14 @@ cmd_certs_sync() {
     summary "Сертификаты в порядке" ""
     return 0
   fi
-  (( ca_ok ))      || info "ca.crt" "отсутствует — раскладку нужно обновить"
-  (( single_cert )) || info "server.crt" "содержит цепочку вместо одного сертификата"
+  (( ca_ok )) || info "ca.crt" "отсутствует — раскладку нужно обновить"
+  if (( ! single_cert )); then
+    if [[ ${n_certs:-0} -eq 0 ]]; then
+      info "server.crt" "отсутствует или пуст"
+    else
+      info "server.crt" "содержит $n_certs сертификата вместо одного"
+    fi
+  fi
 
   docker exec poste mkdir -p /data/ssl >/dev/null 2>&1
   docker cp "$tmp/server.crt" poste:/data/ssl/server.crt >/dev/null 2>&1 \
