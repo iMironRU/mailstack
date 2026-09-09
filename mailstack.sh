@@ -575,18 +575,82 @@ check_domain_dns() {
   if [[ -z $spf ]]; then warn "SPF" "запись v=spf1 не найдена"
   else ok "SPF" "${spf:0:70}"; fi
 
-  local dkim; dkim=$(dns_auth "s1._domainkey.$domain" TXT | head -1)
-  if [[ -z $dkim ]]; then
-    warn "DKIM (s1._domainkey)" "не найдена — значение появится в админке Poste.io после создания домена"
-  else
-    ok "DKIM (s1._domainkey)" "${dkim:0:50}..."
-  fi
+  check_dkim "$domain"
 
   local dmarc; dmarc=$(dns_auth "_dmarc.$domain" TXT | head -1)
   if [[ -z $dmarc ]]; then warn "DMARC" "запись _dmarc не найдена"
   else ok "DMARC" "${dmarc:0:70}"; fi
 
   check_relay_dkim "$domain"
+}
+
+# DKIM домена.
+#
+# Селектор не фиксирован: Poste.io генерирует его при создании ключа в виде
+# s<дата><число>, а не s1, как в большинстве примеров. Жёстко зашитое имя
+# приводило к «запись не найдена» на корректно настроенном домене.
+#
+# Опубликованный ключ дополнительно сверяется с тем, что лежит на сервере:
+# перевыпуск DKIM без обновления DNS ломает подпись молча — письма уходят,
+# но проверку у получателя не проходят.
+DKIM_SELECTOR=''
+
+detect_dkim_selector() {
+  local domain=$1
+  [[ -n ${DKIM_SELECTOR:-} ]] && return 0
+
+  # На самом сервере селектор известен точно
+  if have docker && docker ps -q -f name=^poste$ 2>/dev/null | grep -q .; then
+    local s
+    s=$(docker exec poste sh -c "cat /opt/haraka-smtp/config/dkim/$domain/selector 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
+    [[ -n $s ]] && { DKIM_SELECTOR=$s; return 0; }
+  fi
+
+  # Иначе перебираем распространённые имена
+  local cand
+  for cand in s1 default mail dkim selector1 k1; do
+    [[ -n $(dns_auth "${cand}._domainkey.$domain" TXT | head -1) ]] && { DKIM_SELECTOR=$cand; return 0; }
+  done
+  return 1
+}
+
+check_dkim() {
+  local domain=$1
+  if ! detect_dkim_selector "$domain"; then
+    warn "DKIM" "селектор не определён — ключ ещё не создан в админке Poste.io"
+    hint "Создать: Virtual domains → $domain → DKIM → Create (2048 bit)"
+    return
+  fi
+
+  local rec; rec=$(dns_auth "${DKIM_SELECTOR}._domainkey.$domain" TXT | tr -d '"' | tr -d ' \n')
+  if [[ -z $rec ]]; then
+    fail "DKIM ($DKIM_SELECTOR)" "ключ на сервере есть, а записи в DNS нет"
+    hint "Добавь TXT ${DKIM_SELECTOR}._domainkey с содержимым k=rsa; p=<ключ>"
+    return
+  fi
+
+  local pub_dns; pub_dns=$(sed -n 's/.*p=\([A-Za-z0-9+/=]*\).*/\1/p' <<<"$rec")
+  if [[ -z $pub_dns ]]; then
+    warn "DKIM ($DKIM_SELECTOR)" "запись есть, но не содержит p="
+    return
+  fi
+
+  # Сверяем с ключом на сервере, если он доступен
+  if have docker && docker ps -q -f name=^poste$ 2>/dev/null | grep -q .; then
+    local pub_srv
+    pub_srv=$(docker exec poste sh -c "cat /opt/haraka-smtp/config/dkim/$domain/public 2>/dev/null" 2>/dev/null \
+              | grep -v 'BEGIN\|END' | tr -d '[:space:]')
+    if [[ -n $pub_srv ]]; then
+      if [[ $pub_srv == "$pub_dns" ]]; then
+        ok "DKIM ($DKIM_SELECTOR)" "ключ в DNS совпадает с ключом на сервере"
+      else
+        fail "DKIM ($DKIM_SELECTOR)" "ключ в DNS НЕ совпадает с ключом на сервере"
+        hint "Подпись не пройдёт проверку. Обнови TXT-запись актуальным ключом."
+      fi
+      return
+    fi
+  fi
+  ok "DKIM ($DKIM_SELECTOR)" "опубликован, ${#pub_dns} символов"
 }
 
 # DKIM самого релея. Когда почта уходит через smarthost, он подписывает её
@@ -1086,6 +1150,7 @@ cmd_domain() {
   while (( $# )); do
     case "$1" in
       --ip) want_ip=${2:-}; shift 2 ;;
+      --dkim-selector) DKIM_SELECTOR=${2:-}; shift 2 ;;
       -*)   die "неизвестный флаг domain: $1" ;;
       *)    domain=$1; shift ;;
     esac
