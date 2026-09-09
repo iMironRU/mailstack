@@ -10,3 +10,4 @@ restic-password*
 .DS_Store
 *.log
 tmp/
+backups/

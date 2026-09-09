@@ -1503,17 +1503,43 @@ setup_firewall() {
 
 setup_fail2ban() {
   [[ -d /etc/fail2ban ]] || { warn "fail2ban" "не установлен"; return; }
+
+  # Адреса администратора не банятся никогда. Без этого fail2ban блокирует
+  # того, кто сервером управляет: клиент ssh предлагает все ключи из ~/.ssh
+  # до попытки пароля, упирается в MaxAuthTries, и каждое такое соединение
+  # засчитывается как неудачная аутентификация — пяти хватает для бана.
+  local ignore="127.0.0.1/8 ::1"
+  [[ -n ${TRUSTED_IPS:-} ]] && ignore="$ignore ${TRUSTED_IPS//,/ }"
+
+  # Адрес текущей ssh-сессии добавляем автоматически: почти всегда это и
+  # есть машина администратора
+  local cur_ip=${SSH_CLIENT%% *}
+  [[ $cur_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ignore="$ignore $cur_ip"
+
   if [[ ! -f /etc/fail2ban/jail.local ]]; then
-    cat > /etc/fail2ban/jail.local <<'CONF'
+    cat > /etc/fail2ban/jail.local <<CONF
 [DEFAULT]
 bantime  = 1h
 findtime = 10m
 maxretry = 5
 backend  = systemd
+ignoreip = $ignore
 
 [sshd]
 enabled = true
 CONF
+    ok "fail2ban: не банить" "$ignore"
+  else
+    # Дополняем существующий список, не затирая чужие настройки
+    if grep -q '^ignoreip' /etc/fail2ban/jail.local; then
+      local ip
+      for ip in $ignore; do
+        grep -q "$ip" /etc/fail2ban/jail.local || sed -i "s|^ignoreip *=.*|& $ip|" /etc/fail2ban/jail.local
+      done
+    else
+      sed -i "/^\[DEFAULT\]/a ignoreip = $ignore" /etc/fail2ban/jail.local
+    fi
+    ok "fail2ban: не банить" "$ignore"
   fi
   systemctl enable -q fail2ban 2>/dev/null
   run_step "fail2ban" systemctl restart fail2ban
@@ -1534,6 +1560,7 @@ MAIL_HOSTNAME=$MAIL_HOSTNAME
 LE_EMAIL=$LE_EMAIL
 TZ=$TZ_SETTING
 MAILSTACK_DIR=$MAILSTACK_DIR
+TRUSTED_IPS=${TRUSTED_IPS:-}
 
 # Версии образов. Uptime Kuma держим на ветке 1: в 2.0 удалён импорт
 # JSON-бэкапа, переход туда — только через копирование каталога данных.
@@ -1585,6 +1612,7 @@ cmd_bootstrap() {
       --tz)       TZ_SETTING=${2:-}; shift 2 ;;
       --skip-domain-check) skip_domain=1; shift ;;
       --no-relay) SKIP_RELAY=1; shift ;;
+      --trusted-ip) TRUSTED_IPS="${TRUSTED_IPS:+$TRUSTED_IPS,}${2:-}"; shift 2 ;;
       -y|--yes)   ASSUME_YES=1; shift ;;
       *) die "неизвестный флаг bootstrap: $1" ;;
     esac
@@ -3523,6 +3551,7 @@ ${C_BLD}Флаги bootstrap${C_OFF}
   --tz ZONE          Часовой пояс
   --skip-domain-check  Не проверять домен перед установкой
   --no-relay         Продолжить без SMTP-релея (только приём почты)
+  --trusted-ip ADDR  Не банить этот адрес в fail2ban (можно повторять)
   -y, --yes          Не задавать вопросов (для автоматизации)
 
 ${C_BLD}Флаги backup / update${C_OFF}
