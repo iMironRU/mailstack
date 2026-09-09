@@ -84,6 +84,27 @@ curl -fsSL https://raw.githubusercontent.com/iMironRU/mailstack/main/mailstack.s
 
 Итого с системой — 1017 MB из 1967, свободно 950 MB, swap задействован на 16 MB. Отключение ClamAV решающее: он один занимает больше, чем весь остальной стек.
 
+## Версии образов
+
+Теги вынесены в `.env` — править сгенерированный compose бессмысленно, `deploy` его перезаписывает:
+
+```
+KUMA_IMAGE=louislam/uptime-kuma:1
+NPM_IMAGE=jc21/nginx-proxy-manager:latest
+POSTE_IMAGE=analogic/poste.io:latest
+```
+
+**Uptime Kuma закреплён на ветке 1 намеренно.** В версии 2.0 [удалена загрузка JSON-бэкапа](https://github.com/louislam/uptime-kuma/wiki/Migration-From-v1-To-v2) — единственный способ перенести конфигурацию туда — копирование каталога данных. Если нужно импортировать бэкап из другого экземпляра 1.x, делать это надо **до** перехода на 2.x.
+
+Порядок перехода на 2.x, когда он понадобится:
+
+```bash
+mailstack.sh backup              # схема базы меняется необратимо
+sed -i 's|uptime-kuma:1|uptime-kuma:2|' /opt/mailstack/.env
+mailstack.sh deploy              # Kuma мигрирует базу при старте
+docker logs -f uptime-kuma       # миграция видна в логах
+```
+
 ## Откат
 
 Стенд рассчитан на многократную пересборку, поэтому установка обратима без пересоздания виртуальной машины.

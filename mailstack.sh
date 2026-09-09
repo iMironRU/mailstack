@@ -27,6 +27,19 @@ MAILSTACK_VERSION="0.1.0"
 # FQDN самого почтового хоста — попадает в HELO/myhostname Postfix
 : "${MAIL_HOSTNAME:=}"
 
+# Образы вынесены в переменные: менять версию правкой сгенерированного
+# compose бессмысленно — deploy его перезаписывает.
+#
+# Uptime Kuma закреплён на ветке 1 намеренно. В 2.0 удалена загрузка
+# JSON-бэкапа, и перенос конфигурации возможен только копированием
+# каталога данных. Переход на :2 делается осознанно и только после
+# бэкапа тома — миграция схемы необратима.
+: "${KUMA_IMAGE:=louislam/uptime-kuma:1}"
+: "${NPM_IMAGE:=jc21/nginx-proxy-manager:latest}"
+: "${PORTAINER_IMAGE:=portainer/portainer-ce:latest}"
+: "${POSTE_IMAGE:=analogic/poste.io:latest}"
+: "${AUTOCONFIG_IMAGE:=nginx:alpine}"
+
 # Минимальные требования к железу
 : "${MIN_RAM_MB:=1800}"      # RAM + swap
 : "${MIN_DISK_GB:=10}"       # свободно на /
@@ -1521,6 +1534,14 @@ MAIL_HOSTNAME=$MAIL_HOSTNAME
 LE_EMAIL=$LE_EMAIL
 TZ=$TZ_SETTING
 MAILSTACK_DIR=$MAILSTACK_DIR
+
+# Версии образов. Uptime Kuma держим на ветке 1: в 2.0 удалён импорт
+# JSON-бэкапа, переход туда — только через копирование каталога данных.
+KUMA_IMAGE=$KUMA_IMAGE
+NPM_IMAGE=$NPM_IMAGE
+PORTAINER_IMAGE=$PORTAINER_IMAGE
+POSTE_IMAGE=$POSTE_IMAGE
+AUTOCONFIG_IMAGE=$AUTOCONFIG_IMAGE
 CONF
 
   # SMTP-релей: заполняется, только если провайдер блокирует исходящий 25
@@ -2134,7 +2155,7 @@ write_compose_npm() {
 # Он же выпускает сертификаты Let's Encrypt для всех поддоменов.
 services:
   npm:
-    image: jc21/nginx-proxy-manager:latest
+    image: ${NPM_IMAGE}
     container_name: npm
     restart: unless-stopped
     ports:
@@ -2174,7 +2195,7 @@ write_compose_portainer() {
 # сертификата в настройках прокси.
 services:
   portainer:
-    image: portainer/portainer-ce:latest
+    image: ${PORTAINER_IMAGE}
     container_name: portainer
     restart: unless-stopped
     ports:
@@ -2208,7 +2229,7 @@ write_compose_poste() {
 # требование к сертификату в /data/ssl, который кладёт команда certs-sync.
 services:
   poste:
-    image: analogic/poste.io:latest
+    image: ${POSTE_IMAGE}
     container_name: poste
     restart: unless-stopped
     hostname: ${MAIL_HOSTNAME}
@@ -2247,7 +2268,7 @@ write_compose_kuma() {
 # Uptime Kuma — мониторинг доступности сервисов и почтовых портов
 services:
   uptime-kuma:
-    image: louislam/uptime-kuma:1
+    image: ${KUMA_IMAGE}
     container_name: uptime-kuma
     restart: unless-stopped
     ports:
@@ -2373,7 +2394,7 @@ CONF
 # autoconfig.<домен> и autodiscover.<домен>.
 services:
   autoconfig:
-    image: nginx:alpine
+    image: ${AUTOCONFIG_IMAGE}
     container_name: autoconfig
     restart: unless-stopped
     volumes:
@@ -3236,6 +3257,7 @@ cmd_deploy() {
   [[ -n ${MAIL_HOSTNAME:-} ]] || MAIL_HOSTNAME="mail.$MAIL_DOMAIN"
   : "${TZ:=UTC}"
   export TZ MAIL_DOMAIN MAIL_HOSTNAME MAILSTACK_DIR
+  export KUMA_IMAGE NPM_IMAGE PORTAINER_IMAGE POSTE_IMAGE AUTOCONFIG_IMAGE
 
   have docker || die "Docker не установлен — сначала выполни bootstrap"
   docker info >/dev/null 2>&1 || die "Docker не отвечает"
