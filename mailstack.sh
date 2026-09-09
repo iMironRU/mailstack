@@ -1212,6 +1212,29 @@ check_stack() {
   done <<<"$names"
 }
 
+# Кого сейчас блокирует fail2ban. При жалобе «не могу подключиться» это
+# первое, что стоит проверить: собственный адрес в списке забаненных
+# объясняет проблему быстрее любой другой диагностики.
+check_fail2ban() {
+  have fail2ban-client || return 0
+  head1 "fail2ban"
+  local banned
+  banned=$(fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p')
+  if [[ -z ${banned// /} ]]; then
+    ok "заблокированные адреса" "нет"
+  else
+    info "заблокированы" "$banned"
+    local mine; mine=$(detect_public_ip)
+    if [[ -n $mine ]] && grep -q "$mine" <<<"$banned"; then
+      fail "внимание" "ваш собственный адрес $mine в списке заблокированных"
+      hint "Снять: fail2ban-client set sshd unbanip $mine"
+    fi
+  fi
+  local ign
+  ign=$(grep -m1 '^ignoreip' /etc/fail2ban/jail.local 2>/dev/null | cut -d= -f2-)
+  [[ -n ${ign// /} ]] && info "не банятся" "${ign# }"
+}
+
 check_cert_expiry() {
   local host=$1
   head1 "TLS-сертификат $host"
@@ -1608,6 +1631,18 @@ CONF
   fi
   systemctl enable -q fail2ban 2>/dev/null
   run_step "fail2ban" systemctl restart fail2ban
+
+  # ignoreip действует только на новые баны. Уже наложенный бан переживает
+  # и перезапуск службы, и перезагрузку машины: fail2ban хранит их в
+  # /var/lib/fail2ban/fail2ban.sqlite3 и восстанавливает при старте.
+  # Поэтому доверенные адреса разбаниваем явно.
+  local ip
+  for ip in ${TRUSTED_IPS//,/ } "${SSH_CLIENT%% *}"; do
+    [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    if fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1; then
+      ok "fail2ban: снят бан" "$ip"
+    fi
+  done
 }
 
 save_env() {
@@ -3479,6 +3514,7 @@ cmd_doctor() {
     check_resources
     check_ports_listening
     check_stack
+    check_fail2ban
     check_relay
     check_rdns "$ip"
     check_dnsbl "$ip"
@@ -3503,6 +3539,11 @@ doctor_external() {
   fi
 
   head1 "Доступность портов из интернета"
+  # Пауза между проверками намеренная. Одиннадцать подключений к разным
+  # портам подряд — это профиль сканирования, и системы защиты провайдеров
+  # на него реагируют: инструмент диагностики рискует отрезать от машины
+  # того, кто им пользуется. Полсекунды достаточно, чтобы не выглядеть
+  # перебором, и незаметно на общем времени проверки.
   for p in 25 80 443 465 587 993 995; do
     local desc; desc=$(port_desc "$p")
     if tcp_probe "$ip" "$p" 6; then
@@ -3510,10 +3551,12 @@ doctor_external() {
     else
       fail "порт $p" "недоступен — $desc"
     fi
+    sleep 0.5
   done
 
   head1 "Порты, которые НЕ должны быть открыты наружу"
   for p in 81 9000 9443 3001; do
+    sleep 0.5
     if tcp_probe "$ip" "$p" 4; then
       fail "порт $p" "открыт наружу — админка доступна всему интернету, закрой в ufw"
     else
