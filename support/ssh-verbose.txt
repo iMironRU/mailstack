@@ -1,0 +1,9 @@
+debug1: OpenSSH_10.3p1, LibreSSL 3.3.6
+debug1: Reading configuration data /Users/mal/.ssh/config
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: /etc/ssh/ssh_config line 21: include /etc/ssh/ssh_config.d/* matched no files
+debug1: /etc/ssh/ssh_config line 54: Applying options for *
+debug1: Authenticator provider $SSH_SK_PROVIDER did not resolve; disabling
+debug1: Connecting to 135.106.179.67 [135.106.179.67] port 22.
+debug1: connect to address 135.106.179.67 port 22: Operation timed out
+ssh: connect to host 135.106.179.67 port 22: Operation timed out
