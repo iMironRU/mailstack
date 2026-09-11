@@ -1604,6 +1604,12 @@ setup_fail2ban() {
   local cur_ip=${SSH_CLIENT%% *}
   [[ $cur_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ignore="$ignore $cur_ip"
 
+  # Один и тот же адрес приходит из трёх источников — .env, флага
+  # --trusted-ip и текущей ssh-сессии. Без дедупликации он оседал в
+  # ignoreip трижды, а разбан выполнялся по два раза.
+  ignore=$(tr ' ' '\n' <<<"$ignore" | awk 'NF && !seen[$0]++' | tr '\n' ' ')
+  ignore=${ignore% }
+
   if [[ ! -f /etc/fail2ban/jail.local ]]; then
     cat > /etc/fail2ban/jail.local <<CONF
 [DEFAULT]
@@ -1637,7 +1643,7 @@ CONF
   # /var/lib/fail2ban/fail2ban.sqlite3 и восстанавливает при старте.
   # Поэтому доверенные адреса разбаниваем явно.
   local ip
-  for ip in ${TRUSTED_IPS//,/ } "${SSH_CLIENT%% *}"; do
+  for ip in $ignore; do
     [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
     if fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1; then
       ok "fail2ban: снят бан" "$ip"
