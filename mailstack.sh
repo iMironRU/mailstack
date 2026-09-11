@@ -1655,6 +1655,17 @@ save_env() {
   local dir=$MAILSTACK_DIR
   mkdir -p "$dir"
   local f="$dir/.env"
+
+  # Ключи, которых bootstrap не выставляет сам (учётка NPM, настройки
+  # бэкапа и всё, что дописали другие команды), переносим из прежнего файла.
+  # Раньше .env перезаписывался целиком, и на переезде так пропал пароль
+  # администратора NPM — больше он нигде не хранится.
+  local kept=''
+  if [[ -f $f ]]; then
+    kept=$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$f" \
+      | grep -vE '^(MAIL_DOMAIN|MAIL_HOSTNAME|LE_EMAIL|TZ|MAILSTACK_DIR|TRUSTED_IPS|KUMA_IMAGE|NPM_IMAGE|PORTAINER_IMAGE|POSTE_IMAGE|AUTOCONFIG_IMAGE|RELAY_HOST|RELAY_PORT|RELAY_USER|RELAY_PASS)=' \
+      || true)
+  fi
   # .env содержит адреса и пути, а впоследствии — пароли S3 и restic.
   # Права 600 задаются до записи, чтобы файл не существовал открытым даже
   # доли секунды.
@@ -1687,6 +1698,10 @@ RELAY_PORT=${RELAY_PORT:-587}
 RELAY_USER=${RELAY_USER:-}
 RELAY_PASS='${RELAY_PASS:-}'
 CONF
+  fi
+
+  if [[ -n $kept ]]; then
+    printf '\n# Перенесено из прежнего .env\n%s\n' "$kept" >> "$f"
   fi
 
   # Бэкап настраивается отдельно и в любой момент — он намеренно не
