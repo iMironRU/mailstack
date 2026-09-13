@@ -726,7 +726,12 @@ dns_auth() {
     dig +short +time=3 +tries=1 "@$AUTH_NS" "$name" "$type" 2>/dev/null \
       | grep -v '^;' | grep -v '^[[:space:]]*$'
   else
-    dns_auth "$name" "$type"
+    # Без известного авторитетного сервера спрашиваем обычный резолвер.
+    # Здесь стоял вызов dns_auth — то есть функция вызывала сама себя.
+    # Рекурсия уходила в бесконечность, подоболочка $(...) умирала, и
+    # вызывающий получал пустую строку. Выглядело это не падением, а
+    # «запись не найдена» на всех записях сразу.
+    dns_query "$name" "$type"
   fi
 }
 
@@ -1235,10 +1240,12 @@ check_fail2ban() {
   [[ -n ${ign// /} ]] && info "не банятся" "${ign# }"
 }
 
+# Печатает одну строку STATUS|...: заголовок и вывод проверок сюда класть
+# нельзя — вызывающий забирает результат через $(...), и любая лишняя
+# строка становится первой, а разбор уезжает на неё.
 check_cert_expiry() {
   local host=$1
-  head1 "TLS-сертификат $host"
-  have python3 || { warn "проверка сертификата" "нужен python3"; return; }
+  have python3 || { echo "ERR|нужен python3"; return; }
   python3 - "$host" <<'PY'
 import ssl, socket, sys, datetime
 host = sys.argv[1]
@@ -1248,7 +1255,7 @@ try:
         with ctx.wrap_socket(sock, server_hostname=host) as ss:
             cert = ss.getpeercert()
     exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-    days = (exp - datetime.datetime.utcnow()).days
+    days = (exp - datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)).days
     cn = dict(x[0] for x in cert['subject']).get('commonName', '?')
     issuer = dict(x[0] for x in cert['issuer']).get('organizationName', '?')
     print(f"OK|{cn}|{issuer}|{days}")
@@ -2438,6 +2445,187 @@ networks:
 YML
 }
 
+# Страница-инструкция для людей. Половина обращений в поддержку по почте —
+# это «какой сервер вписать», поэтому параметры вынесены наверх одной
+# таблицей, а дальше идут шаги по системам.
+write_setup_page() {
+  local dir=$1
+  cat > "$dir/setup.html" <<HTML
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Почта ${MAIL_DOMAIN} — настройка</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --ink: #1a1f2b; --dim: #626a7a;
+    --line: #e2e5ea; --accent: #1f6feb; --warn: #8a6100; --warnbg: #fff8e6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151c; --card: #1a1e27; --ink: #e6e8ec; --dim: #9aa3b2;
+      --line: #2a3040; --accent: #5b9dff; --warn: #e8c07a; --warnbg: #2a2417;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 28px 18px 64px; }
+  h1 { font-size: 24px; margin: 0 0 6px; }
+  .lead { color: var(--dim); margin: 0 0 28px; }
+  h2 { font-size: 18px; margin: 34px 0 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 0; vertical-align: top; }
+  th { color: var(--dim); font-weight: 400; width: 42%; }
+  td { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; }
+  ol, ul { padding-left: 22px; margin: 0; }
+  li { margin-bottom: 8px; }
+  a { color: var(--accent); }
+  .btn {
+    display: inline-block; padding: 11px 18px; margin: 4px 0 10px;
+    background: var(--accent); color: #fff; text-decoration: none;
+    border-radius: 8px; font-weight: 500;
+  }
+  .note { background: var(--warnbg); border: 1px solid var(--line); border-left: 3px solid var(--warn);
+          border-radius: 6px; padding: 11px 14px; margin: 12px 0; color: var(--ink); font-size: 15px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px;
+         background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  footer { color: var(--dim); font-size: 14px; border-top: 1px solid var(--line);
+           margin-top: 40px; padding-top: 16px; }
+  /* На телефоне две колонки схлопываются в узкие столбики и таблица
+     становится нечитаемой — там подпись встаёт над значением. */
+  @media (max-width: 460px) {
+    table, tbody, tr, th, td { display: block; width: 100%; }
+    th { padding: 10px 0 0; }
+    td { padding: 2px 0 4px; }
+    tr:first-child th { padding-top: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Почта ${MAIL_DOMAIN}</h1>
+  <p class="lead">Как подключить ящик на компьютере и телефоне.</p>
+
+  <div class="card">
+    <table>
+      <tr><th>Входящая почта</th><td>IMAP · ${MAIL_HOSTNAME} · порт 993 · SSL/TLS</td></tr>
+      <tr><th>Исходящая почта</th><td>SMTP · ${MAIL_HOSTNAME} · порт 465 · SSL/TLS</td></tr>
+      <tr><th>Имя пользователя</th><td>полный адрес, например имя@${MAIL_DOMAIN}</td></tr>
+      <tr><th>Пароль</th><td>пароль ящика</td></tr>
+    </table>
+  </div>
+
+  <div class="note">
+    Логин — это <b>полный адрес</b> с «@», а не имя до собаки. Из-за этого не подключается
+    большинство ящиков.
+  </div>
+
+  <h2>iPhone и iPad</h2>
+  <p>Скачайте профиль — он пропишет всё сам, спросит только адрес и пароль.</p>
+  <a class="btn" href="/mail.mobileconfig">Скачать профиль</a>
+  <ol>
+    <li>Откройте эту страницу <b>в Safari</b> и нажмите кнопку. В Chrome профиль не установится.</li>
+    <li>Появится «Профиль загружен» — подтвердите.</li>
+    <li>Откройте <b>Настройки</b>. Вверху, над вашим именем, появится строка
+      <b>Профиль загружен</b> — нажмите её, затем <b>Установить</b>.</li>
+    <li>Введите адрес ящика и пароль. Готово — ящик появится в приложении «Почта».</li>
+  </ol>
+  <div class="note">
+    Профиль не подписан, поэтому на экране установки будет пометка «Не проверен».
+    Это нормально: файл отдаётся с нашего сервера по HTTPS.
+  </div>
+
+  <h2>Mac</h2>
+  <p>Тот же профиль:</p>
+  <a class="btn" href="/mail.mobileconfig">Скачать профиль</a>
+  <ol>
+    <li>Откройте загруженный файл двойным щелчком.</li>
+    <li><b>Системные настройки</b> → <b>Основные</b> → <b>Профили</b> (на старых версиях —
+      <b>Конфиденциальность и безопасность</b> → <b>Профили</b>).</li>
+    <li>Дважды щёлкните по загруженному профилю и нажмите <b>Установить</b>.</li>
+    <li>Введите адрес и пароль ящика.</li>
+  </ol>
+  <p>Или вручную: <b>Почта</b> → <b>Добавить учётную запись</b> → <b>Другая учётная запись Mail</b>
+    и параметры из таблицы выше.</p>
+
+  <h2>Windows: Outlook</h2>
+  <ol>
+    <li><b>Файл</b> → <b>Добавить учётную запись</b>.</li>
+    <li>Введите адрес и пароль — остальное Outlook найдёт сам.</li>
+  </ol>
+  <p>Если предложит выбрать тип — выберите <b>IMAP</b> и подставьте параметры из таблицы.</p>
+
+  <h2>Thunderbird</h2>
+  <ol>
+    <li><b>Создать</b> → <b>Существующий почтовый адрес</b>.</li>
+    <li>Имя, адрес, пароль → <b>Продолжить</b>. Настройки подставятся сами.</li>
+  </ol>
+
+  <h2>Android</h2>
+  <p>Стандартное приложение Gmail автонастройку чужих доменов не умеет — параметры
+    придётся ввести руками:</p>
+  <ol>
+    <li><b>Настройки</b> → <b>Добавить аккаунт</b> → <b>Другой</b>.</li>
+    <li>Введите адрес, выберите <b>Личный (IMAP)</b>, введите пароль.</li>
+    <li>Сервер входящей: <code>${MAIL_HOSTNAME}</code>, порт 993, SSL/TLS.</li>
+    <li>Сервер исходящей: <code>${MAIL_HOSTNAME}</code>, порт 465, SSL/TLS, вход обязателен.</li>
+  </ol>
+
+  <h2>Без установки: почта в браузере</h2>
+  <p><a href="https://${MAIL_HOSTNAME}">https://${MAIL_HOSTNAME}</a> — тот же ящик, ничего настраивать не нужно.</p>
+
+  <h2>Если не подключается</h2>
+  <ul>
+    <li><b>Не принимает пароль.</b> Проверьте, что в поле логина полный адрес с «@».</li>
+    <li><b>«Пустой пароль» или бесконечный запрос.</b> Клиент сохранил старый пароль —
+      удалите учётную запись и заведите заново.</li>
+    <li><b>Не проходит отправка.</b> Некоторые сети блокируют порт 465. Попробуйте
+      порт 587 с шифрованием STARTTLS — сервер тот же.</li>
+    <li><b>Ошибка сертификата.</b> Проверьте, что в поле сервера именно
+      <code>${MAIL_HOSTNAME}</code>, а не адрес домена или IP.</li>
+  </ul>
+
+  <footer>
+    Настройки те же для всех ящиков на ${MAIL_DOMAIN}.
+    Эта страница доступна по адресу <code>https://${MAIL_HOSTNAME}/setup</code>.
+  </footer>
+
+</div>
+</body>
+</html>
+HTML
+}
+
+# Устойчивый UUID из строки: профиль должен получать один и тот же
+# идентификатор при каждом deploy, иначе повторная установка создаёт
+# на устройстве второй профиль вместо замены первого.
+stable_uuid() {
+  local seed=$1 h=''
+  if have md5sum; then
+    h=$(printf '%s' "$seed" | md5sum | cut -c1-32)
+  elif have md5; then
+    h=$(printf '%s' "$seed" | md5 -q)
+  else
+    h=$(printf '%s' "$seed" | cksum | tr -d ' \n')
+    h="${h}00000000000000000000000000000000"
+    h=${h:0:32}
+  fi
+  printf '%s-%s-%s-%s-%s' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}" \
+    | tr 'a-f' 'A-F'
+}
+
+# ru.example вместо example.ru — Apple ждёт обратную нотацию
+reverse_domain() {
+  printf '%s' "$1" | awk -F. '{for(i=NF;i>0;i--) printf "%s%s", $i, (i>1?".":"")}'
+}
+
 write_compose_autoconfig() {
   local dir="$MAILSTACK_DIR/autoconfig"
   mkdir -p "$dir"
@@ -2497,6 +2685,63 @@ XML
 </Autodiscover>
 XML
 
+  # Apple: конфигурационный профиль. iOS и macOS не понимают ни autoconfig,
+  # ни autodiscover — у них единственный механизм это .mobileconfig.
+  #
+  # Адрес, логин и пароль оставлены пустыми намеренно: установщик спросит их
+  # сам. Иначе профиль пришлось бы генерировать под каждый ящик и как-то
+  # доставлять, а перечислить чужие адреса стало бы делом ссылки.
+  local rdns prof_uuid acc_uuid
+  rdns=$(reverse_domain "$MAIL_DOMAIN")
+  prof_uuid=$(stable_uuid "mailstack:profile:$MAIL_DOMAIN")
+  acc_uuid=$(stable_uuid "mailstack:account:$MAIL_DOMAIN")
+
+  cat > "$dir/mail.mobileconfig" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadType</key><string>com.apple.mail.managed</string>
+      <key>PayloadVersion</key><integer>1</integer>
+      <key>PayloadIdentifier</key><string>${rdns}.mailstack.account</string>
+      <key>PayloadUUID</key><string>${acc_uuid}</string>
+      <key>PayloadDisplayName</key><string>Почта ${MAIL_DOMAIN}</string>
+      <key>EmailAccountDescription</key><string>${MAIL_DOMAIN}</string>
+      <key>EmailAccountType</key><string>EmailTypeIMAP</string>
+      <key>EmailAddress</key><string></string>
+      <key>IncomingMailServerHostName</key><string>${MAIL_HOSTNAME}</string>
+      <key>IncomingMailServerPortNumber</key><integer>993</integer>
+      <key>IncomingMailServerUseSSL</key><true/>
+      <key>IncomingMailServerAuthentication</key><string>EmailAuthPassword</string>
+      <key>IncomingMailServerUsername</key><string></string>
+      <key>OutgoingMailServerHostName</key><string>${MAIL_HOSTNAME}</string>
+      <key>OutgoingMailServerPortNumber</key><integer>465</integer>
+      <key>OutgoingMailServerUseSSL</key><true/>
+      <key>OutgoingMailServerAuthentication</key><string>EmailAuthPassword</string>
+      <key>OutgoingMailServerUsername</key><string></string>
+      <key>OutgoingPasswordSameAsIncoming</key><true/>
+      <key>PreventMove</key><false/>
+      <key>PreventAppSheet</key><false/>
+      <key>SMIMEEnabled</key><false/>
+    </dict>
+  </array>
+  <key>PayloadType</key><string>Configuration</string>
+  <key>PayloadVersion</key><integer>1</integer>
+  <key>PayloadIdentifier</key><string>${rdns}.mailstack</string>
+  <key>PayloadUUID</key><string>${prof_uuid}</string>
+  <key>PayloadDisplayName</key><string>Почта ${MAIL_DOMAIN}</string>
+  <key>PayloadDescription</key><string>Настраивает учётную запись IMAP на ${MAIL_HOSTNAME}. Адрес и пароль ящика будут запрошены при установке.</string>
+  <key>PayloadOrganization</key><string>${MAIL_DOMAIN}</string>
+  <key>PayloadRemovalDisallowed</key><false/>
+</dict>
+</plist>
+XML
+
+  write_setup_page "$dir"
+
   cat > "$dir/nginx.conf" <<'CONF'
 server {
     listen 80;
@@ -2528,6 +2773,33 @@ server {
         alias /srv/autoconfig/autodiscover.xml;
     }
 
+    # Инструкция для людей. Доступна и на своём поддомене, и как /setup
+    # на mail.<домен> — второй адрес проще диктовать вслух.
+    # try_files, а не alias: на запрос «/» nginx считает, что просят
+    # каталог, и приклеивает к alias имя индексного файла — получается
+    # «setup.htmlindex.html» и 500 без единой строки в логе NPM.
+    location = / {
+        default_type text/html;
+        charset utf-8;
+        try_files /setup.html =404;
+    }
+    location = /setup {
+        default_type text/html;
+        charset utf-8;
+        try_files /setup.html =404;
+    }
+
+    # Профиль для iOS и macOS. Установку запускает именно этот Content-Type:
+    # с любым другим Safari просто положит файл в «Загрузки».
+    location = /mail.mobileconfig {
+        alias /srv/autoconfig/mail.mobileconfig;
+        default_type application/x-apple-aspen-config;
+    }
+    location = /setup/mail.mobileconfig {
+        alias /srv/autoconfig/mail.mobileconfig;
+        default_type application/x-apple-aspen-config;
+    }
+
     location = /healthz {
         add_header Content-Type text/plain;
         return 200 'ok';
@@ -2538,9 +2810,10 @@ server {
 CONF
 
   cat > "$COMPOSE_DIR/50-autoconfig.yml" <<'YML'
-# Автонастройка почтовых клиентов: Thunderbird (autoconfig) и Outlook
-# (autodiscover). Наружу не публикуется — только через NPM на поддоменах
-# autoconfig.<домен> и autodiscover.<домен>.
+# Автонастройка почтовых клиентов: Thunderbird (autoconfig), Outlook
+# (autodiscover), профиль для Apple и страница с инструкцией. Наружу не
+# публикуется — только через NPM на поддоменах autoconfig.<домен> и
+# autodiscover.<домен> плюс /setup на mail.<домен>.
 services:
   autoconfig:
     image: ${AUTOCONFIG_IMAGE}
@@ -2550,6 +2823,8 @@ services:
       - ${MAILSTACK_DIR}/autoconfig/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ${MAILSTACK_DIR}/autoconfig/config-v1.1.xml:/srv/autoconfig/config-v1.1.xml:ro
       - ${MAILSTACK_DIR}/autoconfig/autodiscover.xml:/srv/autoconfig/autodiscover.xml:ro
+      - ${MAILSTACK_DIR}/autoconfig/mail.mobileconfig:/srv/autoconfig/mail.mobileconfig:ro
+      - ${MAILSTACK_DIR}/autoconfig/setup.html:/srv/autoconfig/setup.html:ro
     environment:
       - TZ=${TZ}
     networks: [proxy]
@@ -2731,6 +3006,39 @@ npm_create_host() {
   npm_api POST /nginx/proxy-hosts "$payload"
 }
 
+# Инструкция по настройке должна открываться по адресу, который можно
+# продиктовать вслух: mail.<домен>/setup, а не autoconfig.<домен>.
+# Отдаёт её тот же контейнер autoconfig, просто вторым путём.
+#
+# Отдельно: NPM перезагружает nginx при создании и изменении самого хоста,
+# но не при правке его локаций — конфиг на диске меняется, а рабочий
+# процесс продолжает жить со старым. Поэтому reload здесь явный.
+npm_ensure_setup_location() {
+  local fqdn=${MAIL_HOSTNAME:-mail.$MAIL_DOMAIN}
+  local host_id cur payload resp
+  host_id=$(npm_host_exists "$fqdn")
+  if [[ -z $host_id ]]; then
+    warn "$fqdn/setup" "хост не найден — пропускаю"
+    return 0
+  fi
+  cur=$(npm_api GET "/nginx/proxy-hosts/$host_id")
+  if jq -e '[.locations[]? | select(.path == "/setup")] | length > 0' <<<"$cur" >/dev/null 2>&1; then
+    ok "$fqdn/setup" "уже настроен"
+    return 0
+  fi
+  payload=$(jq -c '{locations: ((.locations // []) + [{
+      path: "/setup", advanced_config: "",
+      forward_scheme: "http", forward_host: "autoconfig", forward_port: 80
+    }])}' <<<"$cur")
+  resp=$(npm_api PUT "/nginx/proxy-hosts/$host_id" "$payload")
+  if jq -e '.id' <<<"$resp" >/dev/null 2>&1; then
+    docker exec npm nginx -s reload >/dev/null 2>&1 || true
+    ok "$fqdn/setup" "страница настройки почты"
+  else
+    fail "$fqdn/setup" "$(jq -r '.error.message // "не добавлен"' <<<"$resp" 2>/dev/null | cut -c1-80)"
+  fi
+}
+
 cmd_npm_setup() {
   local skip_certs=0
   while (( $# )); do
@@ -2837,6 +3145,9 @@ cmd_npm_setup() {
   done
 
   info "итого" "создано $created, переиспользовано $reused"
+
+  head1 "Страница настройки почты"
+  npm_ensure_setup_location
 
   head1 "Дальше"
   info "сертификат для SMTP/IMAP" "mailstack.sh certs-sync"
@@ -3461,6 +3772,14 @@ cmd_deploy() {
   compose_up "$COMPOSE_DIR/40-kuma.yml" "uptime-kuma"
   compose_up "$COMPOSE_DIR/50-autoconfig.yml" "autoconfig"
 
+  # Файлы autoconfig смонтированы в контейнер поштучно, и docker compose
+  # их изменение не замечает: контейнер не пересоздаётся, а nginx живёт с
+  # конфигом, прочитанным при старте. Правка страницы или профиля без
+  # этого reload видна на диске и не видна снаружи.
+  if docker exec autoconfig nginx -s reload >/dev/null 2>&1; then
+    ok "autoconfig" "конфигурация перечитана"
+  fi
+
   head1 "Готовность сервисов"
   # Poste.io при первом запуске разворачивает базу и генерирует ключи —
   # это заметно дольше остальных контейнеров
@@ -3546,6 +3865,69 @@ cmd_doctor() {
 
 # Проверка снаружи: то, что принципиально не видно с самого сервера.
 # Локальный ss покажет LISTEN, даже если провайдер режет порт на своём фильтре.
+
+# Код ответа и тип содержимого одним запросом: «200» мало о чём говорит,
+# когда важен именно Content-Type.
+url_probe() {
+  local url=$1 method=${2:-GET} data=${3:-}
+  local args=(-sS -o /dev/null --max-time 12 -w '%{http_code}|%{content_type}')
+  [[ $method == POST ]] && args+=(-X POST -H 'Content-Type: text/xml' --data "${data:-<x/>}")
+  curl "${args[@]}" "$url" 2>/dev/null || printf '000|'
+}
+
+# Проверяет то, что видят клиенты: XML для Thunderbird и Outlook, профиль
+# для Apple и страницу с инструкцией.
+#
+# Профиль смотрим по типу содержимого, а не по коду: установку на iOS
+# запускает именно application/x-apple-aspen-config. С любым другим типом
+# ответ будет тем же 200, Safari молча положит файл в «Загрузки», и
+# выглядеть это будет как «профиль не работает».
+check_autoconfig() {
+  local host=$1 domain=${2:-}
+  local code ctype res
+
+  res=$(url_probe "https://$host/setup"); IFS='|' read -r code ctype <<<"$res"
+  if [[ $code == 200 ]]; then ok "страница настройки" "https://$host/setup"
+  else fail "страница настройки" "https://$host/setup отвечает $code"; fi
+
+  res=$(url_probe "https://$host/setup/mail.mobileconfig")
+  IFS='|' read -r code ctype <<<"$res"
+  if [[ $code != 200 ]]; then
+    fail "профиль Apple" "не отдаётся, код $code"
+  elif [[ $ctype == application/x-apple-aspen-config* ]]; then
+    ok "профиль Apple" "отдаётся с нужным Content-Type"
+  else
+    fail "профиль Apple" "тип «$ctype» вместо application/x-apple-aspen-config — iOS не предложит установку"
+  fi
+
+  [[ -n $domain ]] || return 0
+
+  res=$(url_probe "https://autoconfig.$domain/mail/config-v1.1.xml")
+  IFS='|' read -r code ctype <<<"$res"
+  [[ $code == 200 ]] && ok "autoconfig (Thunderbird)" "autoconfig.$domain" \
+                     || fail "autoconfig (Thunderbird)" "код $code"
+
+  res=$(url_probe "https://autodiscover.$domain/autodiscover/autodiscover.xml" POST)
+  IFS='|' read -r code ctype <<<"$res"
+  [[ $code == 200 ]] && ok "autodiscover (Outlook)" "autodiscover.$domain, POST" \
+                     || fail "autodiscover (Outlook)" "код $code"
+
+  # Запасной путь поиска. Outlook идёт в _autodiscover._tcp, если не нашёл
+  # по HTTP; клиенты по RFC 6186 ищут почтовые порты прямо в DNS.
+  local missing=0 rec
+  for rec in _autodiscover._tcp _imaps._tcp _submissions._tcp; do
+    [[ -n $(dns_query "$rec.$domain" SRV | head -1) ]] || missing=$((missing+1))
+  done
+  if (( missing == 0 )); then
+    ok "SRV-записи" "все три на месте"
+  else
+    warn "SRV-записи" "нет $missing из 3 — запасной путь поиска не работает"
+    hint "_autodiscover._tcp.$domain.  SRV  0 0 443  autodiscover.$domain."
+    hint "_imaps._tcp.$domain.         SRV  0 1 993  $host."
+    hint "_submissions._tcp.$domain.   SRV  0 1 465  $host."
+  fi
+}
+
 doctor_external() {
   local host=$1 domain=${2:-}
   head1 "Внешняя проверка $host"
@@ -3607,6 +3989,7 @@ doctor_external() {
   check_dnsbl "$ip"
 
   if [[ ! $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    head1 "TLS-сертификат $host"
     local res; res=$(check_cert_expiry "$host")
     IFS='|' read -r st f2 f3 f4 <<<"$res"
     case "$st" in
@@ -3618,6 +4001,11 @@ doctor_external() {
   fi
 
   [[ -n $domain ]] && check_domain_dns "$domain" "$ip"
+
+  if [[ ! $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    head1 "Автонастройка почтовых клиентов"
+    check_autoconfig "$host" "$domain"
+  fi
 
   summary "Стенд доступен снаружи корректно" "Есть проблемы с доступностью"
 }
