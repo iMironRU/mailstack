@@ -2527,33 +2527,16 @@ write_setup_page() {
     большинство ящиков.
   </div>
 
-  <h2>iPhone и iPad</h2>
-  <p>Скачайте профиль — он пропишет всё сам, спросит только адрес и пароль.</p>
-  <a class="btn" href="/setup/mail.mobileconfig">Скачать профиль</a>
-  <ol>
-    <li>Откройте эту страницу <b>в Safari</b> и нажмите кнопку. В Chrome профиль не установится.</li>
-    <li>Появится «Профиль загружен» — подтвердите.</li>
-    <li>Откройте <b>Настройки</b>. Вверху, над вашим именем, появится строка
-      <b>Профиль загружен</b> — нажмите её, затем <b>Установить</b>.</li>
-    <li>Введите адрес ящика и пароль. Готово — ящик появится в приложении «Почта».</li>
-  </ol>
+  <h2>iPhone, iPad и Mac</h2>
+  <p>Профиль настроит почту сам. На iPhone и iPad при установке не придётся вводить ничего,
+    кроме код-пароля телефона. Mac спросит только пароль ящика.</p>
+  <a class="btn" href="/setup/apple">Настроить iPhone, iPad или Mac</a>
   <div class="note">
-    Профиль не подписан, поэтому на экране установки будет пометка «Не проверен».
-    Это нормально: файл отдаётся с нашего сервера по HTTPS.
+    Открывайте ссылку <b>в Safari на том устройстве, где нужна почта</b>: в Chrome на iPhone
+    профиль не установится, а ссылка на готовый профиль работает только там, где её открыли.
   </div>
-
-  <h2>Mac</h2>
-  <p>Тот же профиль:</p>
-  <a class="btn" href="/setup/mail.mobileconfig">Скачать профиль</a>
-  <ol>
-    <li>Откройте загруженный файл двойным щелчком.</li>
-    <li><b>Системные настройки</b> → <b>Основные</b> → <b>Профили</b> (на старых версиях —
-      <b>Конфиденциальность и безопасность</b> → <b>Профили</b>).</li>
-    <li>Дважды щёлкните по загруженному профилю и нажмите <b>Установить</b>.</li>
-    <li>Введите адрес и пароль ящика.</li>
-  </ol>
-  <p>Или вручную: <b>Почта</b> → <b>Добавить учётную запись</b> → <b>Другая учётная запись Mail</b>
-    и параметры из таблицы выше.</p>
+  <p>Или вручную на Mac: <b>Почта</b> → <b>Добавить учётную запись</b> →
+    <b>Другая учётная запись Mail</b> и параметры из таблицы выше.</p>
 
   <h2>Windows: Outlook</h2>
   <ol>
@@ -2601,29 +2584,6 @@ write_setup_page() {
 </body>
 </html>
 HTML
-}
-
-# Устойчивый UUID из строки: профиль должен получать один и тот же
-# идентификатор при каждом deploy, иначе повторная установка создаёт
-# на устройстве второй профиль вместо замены первого.
-stable_uuid() {
-  local seed=$1 h=''
-  if have md5sum; then
-    h=$(printf '%s' "$seed" | md5sum | cut -c1-32)
-  elif have md5; then
-    h=$(printf '%s' "$seed" | md5 -q)
-  else
-    h=$(printf '%s' "$seed" | cksum | tr -d ' \n')
-    h="${h}00000000000000000000000000000000"
-    h=${h:0:32}
-  fi
-  printf '%s-%s-%s-%s-%s' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}" \
-    | tr 'a-f' 'A-F'
-}
-
-# ru.example вместо example.ru — Apple ждёт обратную нотацию
-reverse_domain() {
-  printf '%s' "$1" | awk -F. '{for(i=NF;i>0;i--) printf "%s%s", $i, (i>1?".":"")}'
 }
 
 write_compose_autoconfig() {
@@ -2685,60 +2645,8 @@ XML
 </Autodiscover>
 XML
 
-  # Apple: конфигурационный профиль. iOS и macOS не понимают ни autoconfig,
-  # ни autodiscover — у них единственный механизм это .mobileconfig.
-  #
-  # Адрес, логин и пароль оставлены пустыми намеренно: установщик спросит их
-  # сам. Иначе профиль пришлось бы генерировать под каждый ящик и как-то
-  # доставлять, а перечислить чужие адреса стало бы делом ссылки.
-  local rdns prof_uuid acc_uuid
-  rdns=$(reverse_domain "$MAIL_DOMAIN")
-  prof_uuid=$(stable_uuid "mailstack:profile:$MAIL_DOMAIN")
-  acc_uuid=$(stable_uuid "mailstack:account:$MAIL_DOMAIN")
-
-  cat > "$dir/mail.mobileconfig" <<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>PayloadContent</key>
-  <array>
-    <dict>
-      <key>PayloadType</key><string>com.apple.mail.managed</string>
-      <key>PayloadVersion</key><integer>1</integer>
-      <key>PayloadIdentifier</key><string>${rdns}.mailstack.account</string>
-      <key>PayloadUUID</key><string>${acc_uuid}</string>
-      <key>PayloadDisplayName</key><string>Почта ${MAIL_DOMAIN}</string>
-      <key>EmailAccountDescription</key><string>${MAIL_DOMAIN}</string>
-      <key>EmailAccountType</key><string>EmailTypeIMAP</string>
-      <key>EmailAddress</key><string></string>
-      <key>IncomingMailServerHostName</key><string>${MAIL_HOSTNAME}</string>
-      <key>IncomingMailServerPortNumber</key><integer>993</integer>
-      <key>IncomingMailServerUseSSL</key><true/>
-      <key>IncomingMailServerAuthentication</key><string>EmailAuthPassword</string>
-      <key>IncomingMailServerUsername</key><string></string>
-      <key>OutgoingMailServerHostName</key><string>${MAIL_HOSTNAME}</string>
-      <key>OutgoingMailServerPortNumber</key><integer>465</integer>
-      <key>OutgoingMailServerUseSSL</key><true/>
-      <key>OutgoingMailServerAuthentication</key><string>EmailAuthPassword</string>
-      <key>OutgoingMailServerUsername</key><string></string>
-      <key>OutgoingPasswordSameAsIncoming</key><true/>
-      <key>PreventMove</key><false/>
-      <key>PreventAppSheet</key><false/>
-      <key>SMIMEEnabled</key><false/>
-    </dict>
-  </array>
-  <key>PayloadType</key><string>Configuration</string>
-  <key>PayloadVersion</key><integer>1</integer>
-  <key>PayloadIdentifier</key><string>${rdns}.mailstack</string>
-  <key>PayloadUUID</key><string>${prof_uuid}</string>
-  <key>PayloadDisplayName</key><string>Почта ${MAIL_DOMAIN}</string>
-  <key>PayloadDescription</key><string>Настраивает учётную запись IMAP на ${MAIL_HOSTNAME}. Адрес и пароль ящика будут запрошены при установке.</string>
-  <key>PayloadOrganization</key><string>${MAIL_DOMAIN}</string>
-  <key>PayloadRemovalDisallowed</key><false/>
-</dict>
-</plist>
-XML
+  # Профили для iOS и macOS отдаёт сервис profiler (55-profiler.yml): и общий
+  # профиль на домен, и личные с формы. Отсюда в autoconfig они проксируются.
 
   write_setup_page "$dir"
 
@@ -2789,15 +2697,30 @@ server {
         try_files /setup.html =404;
     }
 
-    # Профиль для iOS и macOS. Установку запускает именно этот Content-Type:
-    # с любым другим Safari просто положит файл в «Загрузки».
-    location = /mail.mobileconfig {
-        alias /srv/autoconfig/mail.mobileconfig;
-        default_type application/x-apple-aspen-config;
+    # Профили Apple и форма к ним — сервис profiler. Имя резолвится на каждый
+    # запрос через DNS docker: иначе nginx не стартует, если profiler ещё не
+    # поднят, и держит старый адрес после его пересоздания.
+    #
+    # X-Real-IP берётся из заголовка NPM: сюда трафик приходит только через
+    # него, а лимиты попыток в profiler считаются по адресу клиента.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    location /setup/apple {
+        set $profiler http://profiler:8080;
+        proxy_pass $profiler;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $http_x_real_ip;
+        client_max_body_size 8k;
     }
     location = /setup/mail.mobileconfig {
-        alias /srv/autoconfig/mail.mobileconfig;
-        default_type application/x-apple-aspen-config;
+        set $profiler http://profiler:8080;
+        proxy_pass $profiler;
+        proxy_set_header X-Real-IP $http_x_real_ip;
+    }
+    location = /mail.mobileconfig {
+        set $profiler http://profiler:8080;
+        proxy_pass $profiler;
+        proxy_set_header X-Real-IP $http_x_real_ip;
     }
 
     location = /healthz {
@@ -2811,9 +2734,9 @@ CONF
 
   cat > "$COMPOSE_DIR/50-autoconfig.yml" <<'YML'
 # Автонастройка почтовых клиентов: Thunderbird (autoconfig), Outlook
-# (autodiscover), профиль для Apple и страница с инструкцией. Наружу не
-# публикуется — только через NPM на поддоменах autoconfig.<домен> и
-# autodiscover.<домен> плюс /setup на mail.<домен>.
+# (autodiscover) и страница с инструкцией; профили Apple проксируются в
+# profiler. Наружу не публикуется — только через NPM на поддоменах
+# autoconfig.<домен> и autodiscover.<домен> плюс /setup на mail.<домен>.
 services:
   autoconfig:
     image: ${AUTOCONFIG_IMAGE}
@@ -2823,11 +2746,773 @@ services:
       - ${MAILSTACK_DIR}/autoconfig/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ${MAILSTACK_DIR}/autoconfig/config-v1.1.xml:/srv/autoconfig/config-v1.1.xml:ro
       - ${MAILSTACK_DIR}/autoconfig/autodiscover.xml:/srv/autoconfig/autodiscover.xml:ro
-      - ${MAILSTACK_DIR}/autoconfig/mail.mobileconfig:/srv/autoconfig/mail.mobileconfig:ro
       - ${MAILSTACK_DIR}/autoconfig/setup.html:/srv/autoconfig/setup.html:ro
     environment:
       - TZ=${TZ}
     networks: [proxy]
+
+networks:
+  proxy:
+    external: true
+YML
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROFILER — профили Apple Mail с формы
+#
+# Профиль с пустыми полями iOS заполняет расспросами: адрес три раза, пароль
+# дважды. С вписанными адресом и паролем установка не спрашивает ничего.
+# Поэтому человек вводит их на странице, сервис проверяет пароль входом в
+# IMAP и отдаёт подписанный профиль по одноразовой ссылке.
+#
+# Код сервиса — Python без зависимостей, встроен сюда целиком: скрипт
+# распространяется одним файлом. Тесты вырезают его отсюда же:
+#   python3 tests/test_profiler.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+write_compose_profiler() {
+  local dir="$MAILSTACK_DIR/profiler"
+  mkdir -p "$dir/log"
+
+  cat > "$dir/app.py" <<'PROFILER_APP'
+#!/usr/bin/env python3
+# Профили Apple Mail для mailstack.
+#
+# Человек вводит на странице адрес, имя и — для iPhone — пароль. Сервис
+# проверяет пароль настоящим входом в IMAP, собирает .mobileconfig,
+# подписывает его сертификатом почтового хоста и отдаёт одноразовую ссылку.
+#
+# Зачем вообще пароль в профиле: профиль с пустыми полями iOS заполняет
+# расспросами — адрес три раза, пароль два. С вписанным паролем установка
+# не спрашивает ничего, кроме код-пароля самого телефона.
+#
+# Пароль внутри профиля лежит открытым текстом — подпись не шифрует. Отсюда
+# правила, на которых держится весь сервис:
+#   * профиль живёт только в памяти, на диск не пишется;
+#   * ссылка действует TOKEN_TTL секунд и привязывается к адресу, с которого
+#     её открыли впервые;
+#   * пароль и токен никогда не попадают в журнал;
+#   * для Mac пароль в профиль не кладётся: скачанный файл остаётся в
+#     «Загрузках», и пароль лежал бы там, пока его не удалят.
+#
+# Зависимостей нет: стандартная библиотека Python и утилита openssl.
+
+import hashlib
+import html
+import imaplib
+import json
+import os
+import plistlib
+import re
+import secrets
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+MAIL_HOSTNAME = os.environ.get("MAIL_HOSTNAME", "").strip().lower()
+DOMAINS = [
+    d.strip().lower()
+    for d in os.environ.get("ALLOWED_DOMAINS", os.environ.get("MAIL_DOMAIN", "")).split(",")
+    if d.strip()
+]
+if not MAIL_HOSTNAME or not DOMAINS:
+    sys.exit("нужны MAIL_HOSTNAME и MAIL_DOMAIN")
+
+IMAP_HOST = os.environ.get("IMAP_HOST", MAIL_HOSTNAME)
+IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
+LE_ROOT = os.environ.get("LE_ROOT", "/le")
+LOG_FILE = os.environ.get("LOG_FILE", "")
+LISTEN_PORT = int(os.environ.get("PORT", "8080"))
+TOKEN_TTL = int(os.environ.get("TOKEN_TTL", "300"))
+FAIL_DELAY = float(os.environ.get("FAIL_DELAY", "1.5"))
+
+# Safari может запросить файл повторно после «Разрешить». Строго одно
+# скачивание ломало бы установку, поэтому несколько — но только с того же
+# адреса, что и первое.
+MAX_DOWNLOADS = 3
+
+# Лимиты: (сколько событий, за сколько секунд).
+# Форма не должна подбирать пароли легче, чем порт IMAP, открытый и так.
+LIMIT_FAIL_IP = (5, 900)
+LIMIT_FAIL_MAILBOX = (10, 3600)
+LIMIT_ISSUE_IP = (20, 3600)
+
+EMAIL_RE = re.compile(r"^([a-z0-9][a-z0-9._%+-]{0,63})@([a-z0-9.-]{1,253})$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")
+SAN_RE = re.compile(r"DNS:([A-Za-z0-9.*-]+)")
+IP_RE = re.compile(r"^[0-9a-fA-F:.]{2,45}$")
+
+
+# ── журнал ───────────────────────────────────────────────────────────────────
+
+_log_lock = threading.Lock()
+
+
+def log(event, **fields):
+    """Строка JSON на событие. Порядок ключей постоянный — fail2ban
+    разбирает журнал регулярным выражением."""
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event}
+    rec.update(fields)
+    line = json.dumps(rec, ensure_ascii=False)
+    with _log_lock:
+        print(line, flush=True)
+        if LOG_FILE:
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass
+
+
+# ── лимиты и хранилище ───────────────────────────────────────────────────────
+
+class Limiter:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hits = {}
+
+    def _alive(self, key, window, now):
+        q = [t for t in self._hits.get(key, ()) if now - t < window]
+        if q:
+            self._hits[key] = q
+        else:
+            self._hits.pop(key, None)
+        return q
+
+    def exceeded(self, key, limit):
+        count, window = limit
+        with self._lock:
+            return len(self._alive(key, window, time.monotonic())) >= count
+
+    def hit(self, key):
+        now = time.monotonic()
+        with self._lock:
+            self._hits.setdefault(key, []).append(now)
+            if len(self._hits) > 50000:
+                for k in list(self._hits):
+                    self._alive(k, 3600, now)
+
+
+class Store:
+    """Готовые профили до скачивания. Только память: пароль внутри."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = {}
+
+    def _purge(self):
+        now = time.time()
+        for k in [k for k, v in self._items.items() if v["expires"] <= now]:
+            del self._items[k]
+
+    def put(self, data, meta):
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._purge()
+            if len(self._items) >= 1000:
+                raise RuntimeError("хранилище переполнено")
+            self._items[token] = {
+                "data": data, "meta": meta,
+                "expires": time.time() + TOKEN_TTL,
+                "ip": None, "downloads": 0,
+            }
+        return token
+
+    def peek(self, token):
+        with self._lock:
+            self._purge()
+            item = self._items.get(token)
+            return None if item is None else item["meta"]
+
+    def take(self, token, ip):
+        with self._lock:
+            self._purge()
+            item = self._items.get(token)
+            if item is None:
+                return None, "gone"
+            if item["ip"] is None:
+                item["ip"] = ip
+            elif item["ip"] != ip:
+                return None, "other_ip"
+            if item["downloads"] >= MAX_DOWNLOADS:
+                return None, "exhausted"
+            item["downloads"] += 1
+            return item["data"], "ok"
+
+
+LIMITER = Limiter()
+STORE = Store()
+
+
+# ── профиль ──────────────────────────────────────────────────────────────────
+
+def stable_uuid(seed):
+    # Совпадает с прежней генерацией в mailstack.sh: общий профиль, уже
+    # установленный на устройствах, заменяется, а не дублируется.
+    return str(uuid.UUID(hex=hashlib.md5(seed.encode()).hexdigest())).upper()
+
+
+def reverse_domain(domain):
+    return ".".join(reversed(domain.split(".")))
+
+
+def build_profile(email="", name="", password=None):
+    """Без адреса — общий профиль на домен, всё спросит установщик.
+    С адресом — личный: свой идентификатор, чтобы два ящика на одном
+    устройстве не заменяли друг друга."""
+    domain = email.split("@", 1)[1] if email else DOMAINS[0]
+    rdns = reverse_domain(domain)
+
+    if email:
+        seed = email
+        ident = "%s.mailstack.%s" % (rdns, hashlib.md5(email.encode()).hexdigest()[:10])
+        title = "Почта %s" % email
+        if password:
+            about = "Учётная запись %s на %s. Пароль уже внутри — при установке вводить ничего не нужно." % (email, MAIL_HOSTNAME)
+        else:
+            about = "Учётная запись %s на %s. Пароль будет запрошен при установке." % (email, MAIL_HOSTNAME)
+    else:
+        seed = domain
+        ident = "%s.mailstack" % rdns
+        title = "Почта %s" % domain
+        about = "Настраивает учётную запись IMAP на %s. Адрес и пароль ящика будут запрошены при установке." % MAIL_HOSTNAME
+
+    account = {
+        "PayloadType": "com.apple.mail.managed",
+        "PayloadVersion": 1,
+        "PayloadIdentifier": ident + ".account",
+        "PayloadUUID": stable_uuid("mailstack:account:" + seed),
+        "PayloadDisplayName": title,
+        "EmailAccountDescription": email or domain,
+        "EmailAccountType": "EmailTypeIMAP",
+        "EmailAddress": email,
+        "IncomingMailServerHostName": MAIL_HOSTNAME,
+        "IncomingMailServerPortNumber": 993,
+        "IncomingMailServerUseSSL": True,
+        "IncomingMailServerAuthentication": "EmailAuthPassword",
+        "IncomingMailServerUsername": email,
+        "OutgoingMailServerHostName": MAIL_HOSTNAME,
+        "OutgoingMailServerPortNumber": 465,
+        "OutgoingMailServerUseSSL": True,
+        "OutgoingMailServerAuthentication": "EmailAuthPassword",
+        "OutgoingMailServerUsername": email,
+        "OutgoingPasswordSameAsIncoming": True,
+        "PreventMove": False,
+        "PreventAppSheet": False,
+        "SMIMEEnabled": False,
+    }
+    # Без имени iOS спрашивает его при установке
+    if name:
+        account["EmailAccountName"] = name
+    if password:
+        account["IncomingPassword"] = password
+        account["OutgoingPassword"] = password
+
+    profile = {
+        "PayloadContent": [account],
+        "PayloadType": "Configuration",
+        "PayloadVersion": 1,
+        "PayloadIdentifier": ident,
+        "PayloadUUID": stable_uuid("mailstack:profile:" + seed),
+        "PayloadDisplayName": title,
+        "PayloadDescription": about,
+        "PayloadOrganization": domain,
+        "PayloadRemovalDisallowed": False,
+    }
+    # plistlib, а не шаблон строкой: имя из формы с «</string>» внутри
+    # иначе дописало бы в профиль свои ключи — например, чужой сервер.
+    return plistlib.dumps(profile, fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+_cert = {"dir": None, "checked": 0.0}
+
+
+def find_cert_dir():
+    """Каталог npm-N в томе NPM, чей сертификат выписан на почтовый хост.
+    Перечитывается раз в 10 минут: NPM продлевает сертификат на месте."""
+    now = time.time()
+    if _cert["dir"] and now - _cert["checked"] < 600:
+        return _cert["dir"]
+    live = os.path.join(LE_ROOT, "live")
+    best, best_mtime = None, -1.0
+    try:
+        names = sorted(os.listdir(live))
+    except OSError:
+        names = []
+    for name in names:
+        d = os.path.join(live, name)
+        cert = os.path.join(d, "cert.pem")
+        if not os.path.isfile(cert):
+            continue
+        try:
+            out = subprocess.run(
+                ["openssl", "x509", "-in", cert, "-noout", "-text"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if MAIL_HOSTNAME not in {s.lower() for s in SAN_RE.findall(out)}:
+            continue
+        mtime = os.stat(cert).st_mtime
+        if mtime > best_mtime:
+            best, best_mtime = d, mtime
+    _cert.update(dir=best, checked=now)
+    return best
+
+
+def sign(data):
+    """Подпись сертификатом Let's Encrypt. У него назначение serverAuth,
+    строгая проверка S/MIME в OpenSSL такой не принимает, но iOS и macOS
+    показывают профиль как подписанный хостом — проверено на устройстве.
+    Не вышло подписать — отдаём без подписи: профиль рабочий, просто с
+    красной пометкой на экране установки."""
+    d = find_cert_dir()
+    if not d:
+        log("sign_skipped", reason="нет сертификата для %s" % MAIL_HOSTNAME)
+        return data, False
+    cmd = [
+        "openssl", "smime", "-sign", "-binary", "-nodetach", "-outform", "der",
+        "-signer", os.path.join(d, "cert.pem"),
+        "-inkey", os.path.join(d, "privkey.pem"),
+        "-certfile", os.path.join(d, "chain.pem"),
+    ]
+    try:
+        r = subprocess.run(cmd, input=data, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("sign_failed", error=str(e)[:200])
+        return data, False
+    if r.returncode != 0 or not r.stdout:
+        log("sign_failed", error=r.stderr.decode("utf-8", "replace")[:200])
+        return data, False
+    return r.stdout, True
+
+
+_generic = {"data": None, "at": 0.0}
+
+
+def generic_profile():
+    now = time.time()
+    if _generic["data"] is None or now - _generic["at"] > 600:
+        _generic["data"], _ = sign(build_profile())
+        _generic["at"] = now
+    return _generic["data"]
+
+
+# ── проверка пароля ──────────────────────────────────────────────────────────
+
+def check_password(email, password):
+    """'ok', 'bad' или 'unavailable'.
+
+    AUTHENTICATE PLAIN вместо LOGIN: LOGIN в imaplib кодирует пароль в ASCII
+    и падает на кириллице, а SASL PLAIN передаёт байты UTF-8 как есть."""
+    ctx = ssl.create_default_context()
+    try:
+        conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx, timeout=10)
+    except (OSError, ssl.SSLError, imaplib.IMAP4.error) as e:
+        return "unavailable", str(e)[:200]
+    try:
+        if "AUTH=PLAIN" in conn.capabilities:
+            blob = b"\0" + email.encode("utf-8") + b"\0" + password.encode("utf-8")
+            conn.authenticate("PLAIN", lambda _challenge: blob)
+        else:
+            conn.login(email, password)
+        return "ok", ""
+    except imaplib.IMAP4.error:
+        return "bad", ""
+    except UnicodeEncodeError:
+        return "bad", ""
+    except (OSError, ssl.SSLError) as e:
+        return "unavailable", str(e)[:200]
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def parse_email(raw):
+    s = (raw or "").strip().lower()
+    m = EMAIL_RE.match(s)
+    if not m or m.group(2) not in DOMAINS:
+        return None
+    return s
+
+
+def clean_name(raw):
+    s = re.sub(r"[\x00-\x1f\x7f]", "", raw or "")
+    return " ".join(s.split())[:64]
+
+
+# ── страницы ─────────────────────────────────────────────────────────────────
+
+CSS = """
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1a1f2b; --dim:#626a7a; --line:#e2e5ea;
+        --accent:#1f6feb; --warn:#8a6100; --warnbg:#fff8e6; --err:#b42318; --errbg:#fdecea; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#12151c; --card:#1a1e27; --ink:#e6e8ec; --dim:#9aa3b2; --line:#2a3040;
+          --accent:#5b9dff; --warn:#e8c07a; --warnbg:#2a2417; --err:#ff8a80; --errbg:#2d1a1a; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink);
+       font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+.wrap { max-width:560px; margin:0 auto; padding:28px 18px 64px; }
+h1 { font-size:24px; margin:0 0 6px; }
+h2 { font-size:18px; margin:32px 0 12px; }
+.lead { color:var(--dim); margin:0 0 24px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; }
+label { display:block; margin:0 0 14px; font-weight:500; }
+label small { display:block; color:var(--dim); font-weight:400; font-size:14px; }
+input { display:block; width:100%; margin-top:6px; font:inherit; padding:10px 12px; color:var(--ink);
+        background:var(--bg); border:1px solid var(--line); border-radius:8px; }
+button, .btn { display:inline-block; font:inherit; font-weight:500; padding:11px 18px; color:#fff;
+               background:var(--accent); border:0; border-radius:8px; text-decoration:none; cursor:pointer; }
+.small { color:var(--dim); font-size:14px; margin:14px 0 0; }
+.note { background:var(--warnbg); border:1px solid var(--line); border-left:3px solid var(--warn);
+        border-radius:6px; padding:11px 14px; margin:16px 0; font-size:15px; }
+.error { background:var(--errbg); border:1px solid var(--line); border-left:3px solid var(--err);
+         border-radius:6px; padding:11px 14px; margin:0 0 20px; }
+ol { padding-left:22px; } li { margin-bottom:8px; }
+a { color:var(--accent); }
+"""
+
+CSP = ("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+       "base-uri 'none'; frame-ancestors 'none'")
+
+
+def page(title, body):
+    return (
+        '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<meta name="robots" content="noindex">'
+        "<title>%s</title><style>%s</style></head><body><div class=\"wrap\">%s</div></body></html>"
+        % (html.escape(title), CSS, body)
+    )
+
+
+def form_page(error="", device="", email="", name=""):
+    e = html.escape
+    domain = DOMAINS[0]
+
+    def values(dev):
+        return (e(email), e(name)) if dev == device else ("", "")
+
+    ios_email, ios_name = values("ios")
+    mac_email, mac_name = values("mac")
+    err = '<div class="error">%s</div>' % e(error) if error else ""
+    body = """
+<h1>iPhone, iPad и Mac</h1>
+<p class="lead">Профиль настроит почту %(domain)s сам — останется подтвердить установку.</p>
+%(err)s
+<h2>iPhone и iPad</h2>
+<form class="card" method="post" action="/setup/apple">
+  <input type="hidden" name="device" value="ios">
+  <label>Адрес
+    <input type="email" name="email" value="%(ios_email)s" required autocomplete="email" autocapitalize="off" spellcheck="false" placeholder="имя@%(domain)s">
+  </label>
+  <label>Ваше имя <small>так его увидят получатели писем</small>
+    <input type="text" name="name" value="%(ios_name)s" required maxlength="64" autocomplete="name">
+  </label>
+  <label>Пароль от ящика
+    <input type="password" name="password" required autocomplete="current-password">
+  </label>
+  <button type="submit">Получить профиль</button>
+  <p class="small">Пароль проверяется входом на почтовый сервер и попадает только в профиль.
+  Профиль хранится в памяти сервера, ссылка на него действует 5 минут и открывается только
+  там, где её открыли впервые. После установки пароль лежит в связке ключей iPhone.</p>
+</form>
+
+<h2>Mac</h2>
+<form class="card" method="post" action="/setup/apple">
+  <input type="hidden" name="device" value="mac">
+  <label>Адрес
+    <input type="email" name="email" value="%(mac_email)s" required autocomplete="email" autocapitalize="off" spellcheck="false" placeholder="имя@%(domain)s">
+  </label>
+  <label>Ваше имя <small>так его увидят получатели писем</small>
+    <input type="text" name="name" value="%(mac_name)s" required maxlength="64" autocomplete="name">
+  </label>
+  <button type="submit">Получить профиль</button>
+  <p class="small">Пароль для Mac на сайте не нужен: скачанный профиль остаётся в «Загрузках»,
+  и пароль лежал бы там открытым текстом. Mac спросит его сам при установке — дважды,
+  для входящей и исходящей почты.</p>
+</form>
+
+<p class="small">Не хотите вводить данные на сайте? <a href="/setup/mail.mobileconfig">Общий профиль</a> —
+при установке спросит адрес несколько раз и пароль дважды.</p>
+<p><a href="/setup">← Все способы подключения</a></p>
+""" % {"domain": e(domain), "err": err, "ios_email": ios_email, "ios_name": ios_name,
+       "mac_email": mac_email, "mac_name": mac_name}
+    return page("Почта %s — iPhone, iPad и Mac" % domain, body)
+
+
+def ready_page(token, meta):
+    e = html.escape
+    link = "/setup/apple/p/%s.mobileconfig" % token
+    if meta["device"] == "ios":
+        steps = """
+<ol>
+  <li>Нажмите кнопку и разрешите загрузку профиля.</li>
+  <li>Откройте <b>Настройки</b> — вверху появится строка <b>Профиль загружен</b>.</li>
+  <li><b>Установить</b> → код-пароль iPhone → <b>Установить</b>.</li>
+</ol>
+<p>Всё: ящик появится в приложении «Почта». Ни адрес, ни пароль вводить не придётся.</p>"""
+        who = "iPhone и iPad"
+    else:
+        steps = """
+<ol>
+  <li>Нажмите кнопку — профиль скачается.</li>
+  <li><b>Системные настройки</b> → <b>Основные</b> → <b>Профили</b>, дважды щёлкните по профилю.</li>
+  <li><b>Установить</b> и введите пароль ящика — Mac спросит его для входящей и исходящей почты.</li>
+</ol>"""
+        who = "Mac"
+    body = """
+<h1>Профиль готов</h1>
+<p class="lead">%(email)s · %(who)s</p>
+<a class="btn" href="%(link)s">Установить профиль</a>
+<div class="note">Ссылка действует 5 минут и откроется только на этом устройстве.
+Если почта нужна на другом — получите профиль прямо на нём.</div>
+%(steps)s
+<p class="small"><a href="/setup/apple">Получить профиль заново</a></p>
+""" % {"email": e(meta["email"]), "who": who, "link": link, "steps": steps}
+    return page("Профиль готов", body)
+
+
+def gone_page():
+    body = """
+<h1>Ссылка больше не действует</h1>
+<p class="lead">Ссылка на профиль работает 5 минут и только на том устройстве, где её открыли впервые.</p>
+<a class="btn" href="/setup/apple">Получить профиль заново</a>
+"""
+    return page("Ссылка больше не действует", body)
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "mailstack-profiler"
+    sys_version = ""
+    timeout = 20
+
+    def log_message(self, fmt, *args):
+        # Стандартный журнал http.server пишет путь запроса, а в пути — токен.
+        pass
+
+    def client_ip(self):
+        # Сервис доступен только из сети proxy, адрес клиента выставляет NPM.
+        ip = (self.headers.get("X-Real-IP") or "").strip()
+        return ip if IP_RE.match(ip) else self.client_address[0]
+
+    def send(self, status, body, ctype, extra=None):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def html(self, status, body):
+        self.send(status, body, "text/html; charset=utf-8",
+                  {"Content-Security-Policy": CSP, "X-Frame-Options": "DENY"})
+
+    def route(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/healthz":
+            return ("health",)
+        if path in ("/setup/apple", "/setup/apple/"):
+            return ("form",)
+        if path in ("/setup/mail.mobileconfig", "/mail.mobileconfig"):
+            return ("generic",)
+        m = re.fullmatch(r"/setup/apple/ready/([^/]+)", path)
+        if m:
+            return ("ready", m.group(1))
+        m = re.fullmatch(r"/setup/apple/p/([^/]+)\.mobileconfig", path)
+        if m:
+            return ("download", m.group(1))
+        return ("404",)
+
+    def do_HEAD(self):
+        r = self.route()
+        if r[0] == "download":
+            # HEAD не должен расходовать скачивания
+            ok = TOKEN_RE.match(r[1]) and STORE.peek(r[1]) is not None
+            return self.send(200 if ok else 410, b"", "application/x-apple-aspen-config")
+        return self.do_GET()
+
+    def do_GET(self):
+        r = self.route()
+        if r[0] == "health":
+            return self.send(200, "ok", "text/plain; charset=utf-8")
+        if r[0] == "form":
+            return self.html(200, form_page())
+        if r[0] == "generic":
+            return self.send(200, generic_profile(), "application/x-apple-aspen-config")
+        if r[0] == "ready":
+            meta = STORE.peek(r[1]) if TOKEN_RE.match(r[1]) else None
+            if meta is None:
+                return self.html(410, gone_page())
+            return self.html(200, ready_page(r[1], meta))
+        if r[0] == "download":
+            return self.download(r[1])
+        return self.send(404, "not found", "text/plain; charset=utf-8")
+
+    def download(self, token):
+        ip = self.client_ip()
+        if not TOKEN_RE.match(token):
+            return self.html(410, gone_page())
+        data, status = STORE.take(token, ip)
+        if data is None:
+            log("download_denied", ip=ip, reason=status)
+            return self.html(410, gone_page())
+        log("download", ip=ip)
+        self.send(200, data, "application/x-apple-aspen-config")
+
+    def do_POST(self):
+        if self.route()[0] != "form":
+            return self.send(404, "not found", "text/plain; charset=utf-8")
+        ip = self.client_ip()
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > 4096:
+            return self.send(413, "слишком большой запрос", "text/plain; charset=utf-8")
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        try:
+            form = parse_qs(raw, keep_blank_values=True, max_num_fields=10)
+        except ValueError:
+            form = {}
+
+        def field(k):
+            return (form.get(k) or [""])[0]
+
+        device = field("device")
+        email_raw, name, password = field("email"), clean_name(field("name")), field("password")
+        email = parse_email(email_raw)
+
+        def fail(status, message):
+            return self.html(status, form_page(message, device, email or email_raw.strip()[:254], name))
+
+        if device not in ("ios", "mac"):
+            return fail(400, "Выберите устройство.")
+
+        # Лимит по адресу клиента — до любых обращений к почтовому серверу
+        if LIMITER.exceeded("fail:ip:" + ip, LIMIT_FAIL_IP):
+            log("rate_limited", ip=ip, scope="ip")
+            return fail(429, "Слишком много неудачных попыток. Попробуйте через 15 минут.")
+        if not email:
+            return fail(400, "Нужен полный адрес на домене %s." % " или ".join(DOMAINS))
+        if not name:
+            return fail(400, "Укажите имя — его увидят получатели ваших писем.")
+
+        if device == "ios":
+            if not password:
+                return fail(400, "Введите пароль от ящика.")
+            if LIMITER.exceeded("fail:mb:" + email, LIMIT_FAIL_MAILBOX):
+                log("rate_limited", ip=ip, scope="mailbox", email=email)
+                return fail(429, "Для этого ящика слишком много неудачных попыток. Попробуйте через час.")
+            result, detail = check_password(email, password)
+            if result == "bad":
+                LIMITER.hit("fail:ip:" + ip)
+                LIMITER.hit("fail:mb:" + email)
+                log("auth_fail", ip=ip, email=email)
+                time.sleep(FAIL_DELAY)
+                return fail(403, "Адрес или пароль не подходят.")
+            if result != "ok":
+                log("imap_unavailable", ip=ip, error=detail)
+                return fail(503, "Почтовый сервер сейчас не отвечает. Попробуйте через пару минут.")
+        else:
+            password = None
+
+        if LIMITER.exceeded("issue:ip:" + ip, LIMIT_ISSUE_IP):
+            log("rate_limited", ip=ip, scope="issue")
+            return fail(429, "Слишком много профилей с одного адреса. Попробуйте через час.")
+
+        data, signed = sign(build_profile(email, name, password))
+        try:
+            token = STORE.put(data, {"email": email, "device": device})
+        except RuntimeError:
+            log("store_full", ip=ip)
+            return fail(503, "Сервис перегружен. Попробуйте через пару минут.")
+        LIMITER.hit("issue:ip:" + ip)
+        log("issued", ip=ip, email=email, device=device, signed=signed)
+
+        self.send_response(303)
+        self.send_header("Location", "/setup/apple/ready/" + token)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def main():
+    server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
+    server.daemon_threads = True
+    log("start", port=LISTEN_PORT, host=MAIL_HOSTNAME, domains=DOMAINS,
+        signing=bool(find_cert_dir()))
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PROFILER_APP
+
+  cat > "$COMPOSE_DIR/55-profiler.yml" <<'YML'
+# Профили Apple Mail: форма, проверка пароля входом в IMAP, подпись профиля
+# сертификатом почтового хоста, одноразовые ссылки. Наружу не публикуется —
+# запросы приходят через autoconfig (/setup/apple, /setup/mail.mobileconfig).
+#
+# Том сертификатов NPM нужен для подписи. Приватный ключ там с правами
+# 600 root, поэтому процесс внутри — root; всё остальное урезано:
+# корневая ФС только на чтение, без capabilities, без повышения привилегий.
+services:
+  profiler:
+    build:
+      context: ${MAILSTACK_DIR}/profiler
+      dockerfile_inline: |
+        FROM python:3.12-alpine
+        RUN apk add --no-cache openssl
+        COPY app.py /app/app.py
+        ENV PYTHONDONTWRITEBYTECODE=1
+        CMD ["python3", "-u", "/app/app.py"]
+    image: mailstack-profiler:local
+    container_name: profiler
+    restart: unless-stopped
+    environment:
+      - MAIL_DOMAIN=${MAIL_DOMAIN}
+      - MAIL_HOSTNAME=${MAIL_HOSTNAME}
+      - LOG_FILE=/log/profiler.log
+      - TZ=${TZ}
+    volumes:
+      - npm_letsencrypt:/le:ro
+      - ${MAILSTACK_DIR}/profiler/log:/log
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+    networks: [proxy]
+
+volumes:
+  npm_letsencrypt:
+    external: true
+    name: mailstack_npm_letsencrypt
 
 networks:
   proxy:
@@ -3482,7 +4167,7 @@ CONF
 # ufw, включённый кем-то раньше.
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAILSTACK_CONTAINERS=(poste npm portainer uptime-kuma autoconfig backrest)
+MAILSTACK_CONTAINERS=(poste npm portainer uptime-kuma autoconfig profiler backrest)
 
 remove_stack() {
   have docker || { info "стек" "Docker не установлен, удалять нечего"; return; }
@@ -3511,6 +4196,9 @@ remove_stack() {
   for v in $(docker volume ls -q 2>/dev/null | grep -E '^(mailstack|poste|npm|portainer|uptime|backrest)' || true); do
     docker volume rm "$v" >/dev/null 2>&1 && ok "том удалён" "$v"
   done
+
+  # Образ profiler собран на месте и из реестра не придёт — не оставляем его
+  docker image rm mailstack-profiler:local >/dev/null 2>&1 && ok "образ удалён" "mailstack-profiler:local"
 
   docker network rm proxy >/dev/null 2>&1 && ok "сеть удалена" "proxy"
 }
@@ -3742,6 +4430,7 @@ cmd_deploy() {
   write_compose_poste      && ok "30-poste.yml" "Poste.io — 25, 465, 587, 993, 995"
   write_compose_kuma       && ok "40-kuma.yml" "Uptime Kuma — 127.0.0.1:3001"
   write_compose_autoconfig && ok "50-autoconfig.yml" "autoconfig/autodiscover"
+  write_compose_profiler   && ok "55-profiler.yml" "профили Apple Mail с формы"
 
   head1 "Сеть"
   if docker network inspect proxy >/dev/null 2>&1; then
@@ -3770,6 +4459,16 @@ cmd_deploy() {
   compose_up "$COMPOSE_DIR/20-portainer.yml" "portainer"
   compose_up "$COMPOSE_DIR/30-poste.yml" "poste"
   compose_up "$COMPOSE_DIR/40-kuma.yml" "uptime-kuma"
+  # profiler собирается на месте. --build обязателен: без него compose
+  # пересобирает образ только когда его нет, и правка app.py после
+  # обновления скрипта молча не доезжала бы до контейнера.
+  if docker compose --env-file "$MAILSTACK_DIR/.env" -f "$COMPOSE_DIR/55-profiler.yml" \
+       up -d --build >/tmp/mailstack-up.log 2>&1; then
+    ok "profiler" "запущен"
+  else
+    fail "profiler" "не запустился"
+    sed 's/^/        /' /tmp/mailstack-up.log | tail -6
+  fi
   compose_up "$COMPOSE_DIR/50-autoconfig.yml" "autoconfig"
 
   # Файлы autoconfig смонтированы в контейнер поштучно, и docker compose
@@ -3890,22 +4589,43 @@ check_autoconfig() {
   if [[ $code == 200 ]]; then ok "страница настройки" "https://$host/setup"
   else fail "страница настройки" "https://$host/setup отвечает $code"; fi
 
-  # Проверяем не заранее известный путь, а ту ссылку, что стоит на странице:
-  # страница открывается на двух хостах, и путь, работающий на одном, на
-  # другом уходит в Poste и отвечает 404. Именно так кнопка и сломалась.
+  # Идём по ссылке, которая стоит на странице, а не по заранее известному
+  # пути: страница открывается на двух хостах, и путь, работающий на одном,
+  # на другом уходит в Poste и отвечает 404. Так кнопка однажды и сломалась,
+  # а проверка заранее известного пути оставалась зелёной.
   local href
   href=$(curl -sS --max-time 12 "https://$host/setup" 2>/dev/null \
-    | grep -o 'href="[^"]*\.mobileconfig"' | head -1 | cut -d'"' -f2)
-  [[ -n $href ]] || href=/setup/mail.mobileconfig
-  res=$(url_probe "https://$host$href")
-  IFS='|' read -r code ctype <<<"$res"
-  if [[ $code != 200 ]]; then
-    fail "профиль Apple" "ссылка $href на странице отвечает $code"
-  elif [[ $ctype == application/x-apple-aspen-config* ]]; then
-    ok "профиль Apple" "отдаётся с нужным Content-Type"
+    | grep -o 'href="/setup/apple[^"]*"' | head -1 | cut -d'"' -f2)
+  if [[ -z $href ]]; then
+    fail "форма профиля Apple" "на странице нет ссылки на /setup/apple"
   else
-    fail "профиль Apple" "тип «$ctype» вместо application/x-apple-aspen-config — iOS не предложит установку"
+    res=$(url_probe "https://$host$href"); IFS='|' read -r code ctype <<<"$res"
+    if [[ $code == 200 && $ctype == text/html* ]]; then
+      ok "форма профиля Apple" "https://$host$href"
+    else
+      fail "форма профиля Apple" "$href отвечает $code — сервис profiler запущен?"
+    fi
   fi
+
+  # Общий профиль. Установку на iOS запускает именно этот Content-Type:
+  # с любым другим ответ тот же 200, а Safari молча кладёт файл в «Загрузки».
+  local tmpf; tmpf=$(mktemp)
+  code=$(curl -sS -o "$tmpf" --max-time 12 -w '%{http_code}|%{content_type}' \
+    "https://$host/setup/mail.mobileconfig" 2>/dev/null || printf '000|')
+  IFS='|' read -r code ctype <<<"$code"
+  if [[ $code != 200 ]]; then
+    fail "профиль Apple" "не отдаётся, код $code"
+  elif [[ $ctype != application/x-apple-aspen-config* ]]; then
+    fail "профиль Apple" "тип «$ctype» вместо application/x-apple-aspen-config — iOS не предложит установку"
+  elif head -c 5 "$tmpf" | grep -q '<?xml'; then
+    warn "профиль Apple" "не подписан — на экране установки будет красное «Не подписано»"
+    hint "profiler не нашёл сертификат ${host} в томе NPM: docker logs profiler"
+  elif have openssl && openssl smime -verify -noverify -inform der -in "$tmpf" -out /dev/null 2>/dev/null; then
+    ok "профиль Apple" "подписан, отдаётся с нужным Content-Type"
+  else
+    warn "профиль Apple" "отдаётся, но подпись проверить не удалось"
+  fi
+  rm -f "$tmpf"
 
   [[ -n $domain ]] || return 0
 
