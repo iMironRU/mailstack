@@ -2529,7 +2529,7 @@ write_setup_page() {
 
   <h2>iPhone и iPad</h2>
   <p>Скачайте профиль — он пропишет всё сам, спросит только адрес и пароль.</p>
-  <a class="btn" href="/mail.mobileconfig">Скачать профиль</a>
+  <a class="btn" href="/setup/mail.mobileconfig">Скачать профиль</a>
   <ol>
     <li>Откройте эту страницу <b>в Safari</b> и нажмите кнопку. В Chrome профиль не установится.</li>
     <li>Появится «Профиль загружен» — подтвердите.</li>
@@ -2544,7 +2544,7 @@ write_setup_page() {
 
   <h2>Mac</h2>
   <p>Тот же профиль:</p>
-  <a class="btn" href="/mail.mobileconfig">Скачать профиль</a>
+  <a class="btn" href="/setup/mail.mobileconfig">Скачать профиль</a>
   <ol>
     <li>Откройте загруженный файл двойным щелчком.</li>
     <li><b>Системные настройки</b> → <b>Основные</b> → <b>Профили</b> (на старых версиях —
@@ -3890,10 +3890,17 @@ check_autoconfig() {
   if [[ $code == 200 ]]; then ok "страница настройки" "https://$host/setup"
   else fail "страница настройки" "https://$host/setup отвечает $code"; fi
 
-  res=$(url_probe "https://$host/setup/mail.mobileconfig")
+  # Проверяем не заранее известный путь, а ту ссылку, что стоит на странице:
+  # страница открывается на двух хостах, и путь, работающий на одном, на
+  # другом уходит в Poste и отвечает 404. Именно так кнопка и сломалась.
+  local href
+  href=$(curl -sS --max-time 12 "https://$host/setup" 2>/dev/null \
+    | grep -o 'href="[^"]*\.mobileconfig"' | head -1 | cut -d'"' -f2)
+  [[ -n $href ]] || href=/setup/mail.mobileconfig
+  res=$(url_probe "https://$host$href")
   IFS='|' read -r code ctype <<<"$res"
   if [[ $code != 200 ]]; then
-    fail "профиль Apple" "не отдаётся, код $code"
+    fail "профиль Apple" "ссылка $href на странице отвечает $code"
   elif [[ $ctype == application/x-apple-aspen-config* ]]; then
     ok "профиль Apple" "отдаётся с нужным Content-Type"
   else
