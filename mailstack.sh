@@ -2420,11 +2420,19 @@ YML
 }
 
 write_compose_kuma() {
-  cat > "$COMPOSE_DIR/40-kuma.yml" <<'YML'
+  # Внутри сети docker имя mail.<домен> принадлежит контейнеру Poste — оно
+  # задано ему как hostname ради корректного HELO. Из-за этого Kuma,
+  # проверяя веб-почту по имени, попадает в сам Poste, где 443 никто не
+  # слушает: этот порт держит NPM. Поэтому почтовое имя внутри контейнера
+  # Kuma указывает на внешний адрес сервера — проверка идёт тем же путём,
+  # что и у пользователей.
+  local ip; ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+
+  cat > "$COMPOSE_DIR/40-kuma.yml" <<YML
 # Uptime Kuma — мониторинг доступности сервисов и почтовых портов
 services:
   uptime-kuma:
-    image: ${KUMA_IMAGE}
+    image: \${KUMA_IMAGE}
     container_name: uptime-kuma
     restart: unless-stopped
     ports:
@@ -2432,7 +2440,9 @@ services:
     volumes:
       - kuma_data:/app/data
     environment:
-      - TZ=${TZ}
+      - TZ=\${TZ}
+    extra_hosts:
+      - "\${MAIL_HOSTNAME}:${ip:-127.0.0.1}"
     networks: [proxy]
 
 volumes:
